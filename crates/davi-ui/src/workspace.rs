@@ -13,7 +13,7 @@ use davi_core::model::HttpMethod;
 use davi_net::HttpEngine;
 use gpui::{
     AnyElement, App, Context, Div, Entity, FocusHandle, Focusable, MouseButton, PathPromptOptions,
-    SharedString, Stateful, Subscription, Window, actions, div, prelude::*, px, uniform_list,
+    SharedString, Stateful, Subscription, Window, actions, div, img, prelude::*, px, uniform_list,
 };
 use gpui_component::dialog::DialogButtonProps;
 use gpui_component::input::{Input, InputState};
@@ -391,11 +391,14 @@ impl Workspace {
         match collection::load_request(&path) {
             Ok(request) => {
                 let editor = cx.new(|cx| RequestEditor::new(path, request, window, cx));
-                let subscription =
-                    cx.subscribe_in(&editor, window, |this, editor, event, _, cx| match event {
+                let subscription = cx.subscribe_in(
+                    &editor,
+                    window,
+                    |this, editor, event, window, cx| match event {
                         EditorEvent::Changed => cx.notify(),
-                        EditorEvent::SendRequested => this.send(editor.clone(), cx),
-                    });
+                        EditorEvent::SendRequested => this.send(editor.clone(), window, cx),
+                    },
+                );
                 self._tab_subscriptions
                     .push((editor.entity_id(), subscription));
                 self.tabs.push(editor);
@@ -470,17 +473,17 @@ impl Workspace {
             .map_or_else(|| "No Environment".into(), |e| e.name.clone().into())
     }
 
-    fn send(&mut self, editor: Entity<RequestEditor>, cx: &mut Context<Self>) {
+    fn send(&mut self, editor: Entity<RequestEditor>, window: &mut Window, cx: &mut Context<Self>) {
         let scope = self.var_scope();
         let engine = self.engine.clone();
-        editor.update(cx, |editor, cx| editor.send(&engine, scope, cx));
+        editor.update(cx, |editor, cx| editor.send(&engine, scope, window, cx));
     }
 
     // -- actions ---------------------------------------------------------------
 
-    fn on_send(&mut self, _: &SendRequest, _: &mut Window, cx: &mut Context<Self>) {
+    fn on_send(&mut self, _: &SendRequest, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(tab) = self.active().cloned() {
-            self.send(tab, cx);
+            self.send(tab, window, cx);
         }
     }
 
@@ -616,7 +619,14 @@ impl Workspace {
                     .flex()
                     .flex_col()
                     .gap_4()
-                    .child(div().text_2xl().child("Davi"))
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_3()
+                            .child(img(app_icon()).size(px(56.)))
+                            .child(div().text_2xl().child("Davi")),
+                    )
                     .child(
                         div()
                             .text_sm()
@@ -1081,6 +1091,18 @@ impl Render for Workspace {
             .children(Root::render_dialog_layer(window, cx))
             .children(Root::render_notification_layer(window, cx))
     }
+}
+
+/// The app icon, decoded once and shared.
+fn app_icon() -> Arc<gpui::Image> {
+    static ICON: std::sync::OnceLock<Arc<gpui::Image>> = std::sync::OnceLock::new();
+    ICON.get_or_init(|| {
+        Arc::new(gpui::Image::from_bytes(
+            gpui::ImageFormat::Png,
+            include_bytes!("../../../assets/icon.png").to_vec(),
+        ))
+    })
+    .clone()
 }
 
 fn button(id: &'static str, label: &'static str, primary: bool) -> Stateful<Div> {

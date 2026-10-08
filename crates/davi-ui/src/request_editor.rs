@@ -16,11 +16,11 @@ use davi_core::env::VarScope;
 use davi_core::model::{ApiKeyPlacement, Auth, BodyMode, HttpMethod, HttpRequest, KeyValue};
 use davi_net::{Canceller, HttpEngine, NetError};
 use gpui::{
-    AnyElement, App, Context, Entity, EventEmitter, SharedString, StyledText, Subscription, Window,
-    deferred, div, prelude::*, px, uniform_list,
+    AnyElement, App, ClipboardItem, Context, Entity, EventEmitter, SharedString, Subscription,
+    Window, deferred, div, prelude::*, px,
 };
-use gpui_component::Sizable;
 use gpui_component::input::{Input, InputEvent, InputState};
+use gpui_component::{Sizable, WindowExt};
 
 use crate::kv_editor::{KvEditor, KvEvent};
 use crate::response_view::ResponseView;
@@ -133,6 +133,10 @@ pub struct RequestEditor {
     editor_tab: EditorTab,
     response_tab: ResponseTab,
     response: ResponseState,
+    /// Read-only, selectable viewers for the last response.
+    response_body: Entity<InputState>,
+    response_headers: Entity<InputState>,
+    response_error: Entity<InputState>,
     method_menu_open: bool,
     next_request_id: u64,
     _subscriptions: Vec<Subscription>,
@@ -215,6 +219,20 @@ impl RequestEditor {
                 .line_number(true)
                 .default_value(body_value)
         });
+
+        let viewer = |language: &'static str, window: &mut Window, cx: &mut Context<Self>| {
+            cx.new(|cx| {
+                InputState::new(window, cx)
+                    .code_editor(language)
+                    .line_number(language != "text")
+                    .soft_wrap(false)
+                    .searchable(true)
+            })
+        };
+        let response_body = viewer("json", window, cx);
+        let response_headers = viewer("text", window, cx);
+        let response_error =
+            cx.new(|cx| InputState::new(window, cx).multi_line(true).soft_wrap(true));
 
         let mut subscriptions = Vec::new();
 
@@ -299,6 +317,9 @@ impl RequestEditor {
             vars_post,
             editor_tab: EditorTab::Params,
             response_tab: ResponseTab::Body,
+            response_body,
+            response_headers,
+            response_error,
             response: ResponseState::Idle,
             method_menu_open: false,
             next_request_id: 0,
@@ -482,7 +503,13 @@ impl RequestEditor {
         Ok(())
     }
 
-    pub fn send(&mut self, engine: &HttpEngine, scope: VarScope, cx: &mut Context<Self>) {
+    pub fn send(
+        &mut self,
+        engine: &HttpEngine,
+        scope: VarScope,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if let ResponseState::Loading { canceller, .. } = &self.response {
             canceller.cancel();
             self.response = ResponseState::Idle;
@@ -490,8 +517,11 @@ impl RequestEditor {
             return;
         }
         if self.request.url.trim().is_empty() {
-            self.response = ResponseState::Failed("Enter a URL first".into());
-            cx.notify();
+            self.show_state(
+                ResponseState::Failed("Enter a URL first".into()),
+                window,
+                cx,
+            );
             return;
         }
 
@@ -504,7 +534,7 @@ impl RequestEditor {
         };
         cx.notify();
 
-        cx.spawn(async move |this, cx| {
+        cx.spawn_in(window, async move |this, cx| {
             let state = match handle.response().await {
                 Ok(response) => {
                     // Pretty-print + highlight off the UI thread.
@@ -517,17 +547,52 @@ impl RequestEditor {
                 Err(NetError::Cancelled) => ResponseState::Idle,
                 Err(e) => ResponseState::Failed(e.to_string().into()),
             };
-            this.update(cx, |this, cx| {
+            this.update_in(cx, |this, window, cx| {
                 // Ignore results of requests that were superseded.
                 if matches!(this.response, ResponseState::Loading { id: current, .. } if current == id)
                 {
-                    this.response = state;
-                    cx.notify();
+                    this.show_state(state, window, cx);
                 }
             })
             .ok();
         })
         .detach();
+    }
+
+    /// Load a finished response (or error) into the read-only viewers.
+    fn show_state(&mut self, state: ResponseState, window: &mut Window, cx: &mut Context<Self>) {
+        match &state {
+            ResponseState::Ready(view) => {
+                let (body, language, headers) =
+                    (view.body.clone(), view.language, view.headers_text());
+                self.response_body.update(cx, |input, cx| {
+                    input.set_highlighter(language, cx);
+                    input.set_value(body, window, cx);
+                });
+                self.response_headers
+                    .update(cx, |input, cx| input.set_value(headers, window, cx));
+            }
+            ResponseState::Failed(error) => {
+                let error = error.to_string();
+                self.response_error
+                    .update(cx, |input, cx| input.set_value(error, window, cx));
+            }
+            ResponseState::Idle | ResponseState::Loading { .. } => {}
+        }
+        self.response = state;
+        cx.notify();
+    }
+
+    fn copy_response(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let ResponseState::Ready(view) = &self.response else {
+            return;
+        };
+        let (text, what) = match self.response_tab {
+            ResponseTab::Body => (view.body.clone(), "Response body"),
+            ResponseTab::Headers => (view.headers_text(), "Response headers"),
+        };
+        cx.write_to_clipboard(ClipboardItem::new_string(text));
+        window.push_notification(format!("{what} copied to clipboard"), cx);
     }
 
     pub fn cancel(&mut self) {
@@ -846,20 +911,19 @@ impl RequestEditor {
                 )));
             }
             ResponseState::Loading { .. } => return panel.child(placeholder("Sending…".into())),
-            ResponseState::Failed(error) => {
+            ResponseState::Failed(_) => {
                 return panel.child(
                     div()
-                        .p_4()
+                        .p_3()
                         .flex()
                         .flex_col()
                         .gap_2()
                         .child(div().text_color(c(theme::ERROR)).child("Request failed"))
                         .child(
                             div()
+                                .h(px(120.))
                                 .font_family(theme::MONO_FONT)
-                                .text_sm()
-                                .text_color(c(theme::TEXT_MUTED))
-                                .child(error.clone()),
+                                .child(Input::new(&self.response_error).disabled(true).h_full()),
                         ),
                 );
             }
@@ -901,7 +965,23 @@ impl RequestEditor {
                         .text_color(c(theme::WARNING))
                         .child("truncated"),
                 )
-            });
+            })
+            .child(div().flex_1())
+            .child(
+                div()
+                    .id("copy-response")
+                    .px_3()
+                    .py_1()
+                    .rounded_md()
+                    .cursor_pointer()
+                    .text_sm()
+                    .border_1()
+                    .border_color(c(theme::BORDER))
+                    .text_color(c(theme::TEXT_MUTED))
+                    .hover(|s| s.bg(c(theme::ELEVATED)).text_color(c(theme::TEXT)))
+                    .on_click(cx.listener(|this, _, window, cx| this.copy_response(window, cx)))
+                    .child("Copy"),
+            );
 
         let tabs = div()
             .flex()
@@ -941,50 +1021,16 @@ impl RequestEditor {
                 }),
             );
 
-        let body: AnyElement = match self.response_tab {
-            ResponseTab::Body => {
-                let lines = view.lines.clone();
-                // Virtualized: only visible lines are laid out.
-                uniform_list("response-body", lines.len(), move |range, _, _| {
-                    range
-                        .map(|ix| {
-                            let line = &lines[ix];
-                            div().whitespace_nowrap().child(
-                                StyledText::new(line.text.clone())
-                                    .with_highlights(line.highlights.iter().cloned()),
-                            )
-                        })
-                        .collect()
-                })
-                .size_full()
-                .px_3()
-                .py_2()
-                .font_family(theme::MONO_FONT)
-                .text_sm()
-                .into_any_element()
-            }
-            ResponseTab::Headers => div()
-                .id("response-headers")
-                .size_full()
-                .overflow_y_scroll()
-                .p_3()
-                .children(view.headers.iter().map(|(k, v)| {
-                    div()
-                        .flex()
-                        .gap_3()
-                        .py_0p5()
-                        .text_sm()
-                        .child(
-                            div()
-                                .w(px(200.))
-                                .flex_none()
-                                .text_color(c(theme::SYN_KEY))
-                                .child(k.clone()),
-                        )
-                        .child(div().min_w_0().child(v.clone()))
-                }))
-                .into_any_element(),
+        // Read-only code editors: selectable, Ctrl+C / Ctrl+A, Ctrl+F search,
+        // horizontal scrolling for long lines.
+        let viewer = match self.response_tab {
+            ResponseTab::Body => &self.response_body,
+            ResponseTab::Headers => &self.response_headers,
         };
+        let body = div()
+            .size_full()
+            .font_family(theme::MONO_FONT)
+            .child(Input::new(viewer).disabled(true).bordered(false).h_full());
 
         panel
             .child(header)
