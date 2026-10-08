@@ -17,6 +17,7 @@ davi-net = { path = "crates/davi-net" }
 
 # UI
 gpui = "0.2.2"
+gpui-component = { version = "=0.5.1", default-features = false }
 
 # Async / networking
 tokio = { version = "1.47", default-features = false, features = ["rt-multi-thread", "sync", "time", "fs"] }

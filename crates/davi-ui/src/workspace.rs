@@ -1,26 +1,27 @@
-//! Root view: sidebar | (tab bar / request panel | response panel), plus a
-//! status bar and the command palette overlay.
-//!
-//! All application state lives in this one entity for now; render helpers
-//! are split per panel. As panels gain editable state (text inputs, code
-//! editors) they graduate into their own entities, the way the palette
-//! already has.
+//! Root view: sidebar | (tab bar / active request editor), a status bar,
+//! the welcome screen when no collection is open, the command palette and
+//! dialog layers.
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 use std::sync::Arc;
 
-use davi_core::collection::{self, Collection, Folder, Node};
+use davi_core::collection::{self, Collection, Node};
 use davi_core::env::VarScope;
-use davi_core::model::{Auth, BodyMode, HttpMethod, HttpRequest, KeyValue};
-use davi_net::{Canceller, HttpEngine, NetError};
+use davi_core::model::HttpMethod;
+use davi_net::HttpEngine;
 use gpui::{
-    AnyElement, Context, Div, Entity, FocusHandle, Focusable, MouseButton, SharedString, Stateful,
-    StyledText, Subscription, Window, actions, div, prelude::*, px, uniform_list,
+    AnyElement, App, Context, Div, Entity, FocusHandle, Focusable, MouseButton, PathPromptOptions,
+    SharedString, Stateful, Subscription, Window, actions, div, prelude::*, px, uniform_list,
 };
+use gpui_component::dialog::DialogButtonProps;
+use gpui_component::input::{Input, InputState};
+use gpui_component::{Root, WindowExt};
 
 use crate::palette::{CommandPalette, PaletteEvent, PaletteItem};
-use crate::response_view::ResponseView;
+use crate::request_editor::{EditorEvent, RequestEditor, shortcut};
+use crate::settings::Settings;
 use crate::theme::{self, c};
 
 actions!(
@@ -31,81 +32,15 @@ actions!(
         SaveRequest,
         CloseTab,
         NextEnvironment,
+        NewRequest,
+        NewFolder,
+        OpenCollection,
+        NewCollection,
         Quit
     ]
 );
 
-const SIDEBAR_WIDTH: f32 = 260.;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum EditorTab {
-    Params,
-    Headers,
-    Auth,
-    Body,
-    Vars,
-}
-
-impl EditorTab {
-    const ALL: [EditorTab; 5] = [
-        EditorTab::Params,
-        EditorTab::Headers,
-        EditorTab::Auth,
-        EditorTab::Body,
-        EditorTab::Vars,
-    ];
-
-    fn label(self) -> &'static str {
-        match self {
-            EditorTab::Params => "Params",
-            EditorTab::Headers => "Headers",
-            EditorTab::Auth => "Auth",
-            EditorTab::Body => "Body",
-            EditorTab::Vars => "Vars",
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ResponseTab {
-    Body,
-    Headers,
-}
-
-enum ResponseState {
-    Idle,
-    Loading { id: u64, canceller: Canceller },
-    Ready(Arc<ResponseView>),
-    Failed(SharedString),
-}
-
-struct RequestTab {
-    path: PathBuf,
-    /// Last state written to / read from disk, for the dirty indicator.
-    saved: HttpRequest,
-    request: HttpRequest,
-    editor_tab: EditorTab,
-    response_tab: ResponseTab,
-    response: ResponseState,
-}
-
-impl RequestTab {
-    fn is_dirty(&self) -> bool {
-        self.request != self.saved
-    }
-
-    fn title(&self) -> SharedString {
-        if self.request.meta.name.is_empty() {
-            self.path
-                .file_stem()
-                .map(|s| s.to_string_lossy().into_owned())
-                .unwrap_or_default()
-                .into()
-        } else {
-            self.request.meta.name.clone().into()
-        }
-    }
-}
+const SIDEBAR_WIDTH: f32 = 270.;
 
 enum SidebarRow {
     Folder {
@@ -122,22 +57,27 @@ enum SidebarRow {
     },
 }
 
+type NameCallback = Rc<dyn Fn(&mut Workspace, String, &mut Window, &mut Context<Workspace>)>;
+
 pub struct Workspace {
     focus_handle: FocusHandle,
     engine: HttpEngine,
+    settings: Settings,
     collection: Option<Collection>,
     collapsed: HashSet<PathBuf>,
+    /// Folder new requests/folders are created in (`None` = collection root).
+    selected_folder: Option<PathBuf>,
     sidebar_rows: Vec<SidebarRow>,
-    tabs: Vec<RequestTab>,
+    tabs: Vec<Entity<RequestEditor>>,
     active_tab: Option<usize>,
     environment: Option<usize>,
     palette: Option<(Entity<CommandPalette>, Subscription)>,
     notice: Option<(SharedString, bool)>,
-    next_request_id: u64,
+    _tab_subscriptions: Vec<(gpui::EntityId, Subscription)>,
 }
 
 impl Focusable for Workspace {
-    fn focus_handle(&self, _: &gpui::App) -> FocusHandle {
+    fn focus_handle(&self, _: &App) -> FocusHandle {
         self.focus_handle.clone()
     }
 }
@@ -151,48 +91,242 @@ impl Workspace {
     ) -> Self {
         let focus_handle = cx.focus_handle();
         window.focus(&focus_handle);
-
-        let mut notice = None;
-        let collection = collection_dir.and_then(|dir| match Collection::open(&dir) {
-            Ok(c) => {
-                if !c.issues.is_empty() {
-                    for issue in &c.issues {
-                        log::warn!("{}", issue.error);
-                    }
-                    notice = Some((
-                        format!("{} file(s) failed to load, see log", c.issues.len()).into(),
-                        true,
-                    ));
-                }
-                Some(c)
-            }
-            Err(e) => {
-                notice = Some((e.to_string().into(), true));
-                None
-            }
-        });
-        let environment = collection
-            .as_ref()
-            .and_then(|c| (!c.environments.is_empty()).then_some(0));
+        let settings = Settings::load();
+        let initial = collection_dir.or_else(|| settings.last_collection());
 
         let mut this = Self {
             focus_handle,
             engine,
-            collection,
+            settings,
+            collection: None,
             collapsed: HashSet::new(),
+            selected_folder: None,
             sidebar_rows: Vec::new(),
             tabs: Vec::new(),
             active_tab: None,
-            environment,
+            environment: None,
             palette: None,
-            notice,
-            next_request_id: 0,
+            notice: None,
+            _tab_subscriptions: Vec::new(),
         };
-        this.rebuild_sidebar();
+        if let Some(dir) = initial {
+            this.open_collection(dir, window, cx);
+        }
         this
     }
 
-    // -- state ---------------------------------------------------------------
+    // -- collection ------------------------------------------------------------
+
+    fn open_collection(&mut self, dir: PathBuf, _window: &mut Window, cx: &mut Context<Self>) {
+        let result = collection::ensure_collection(&dir).and_then(|()| Collection::open(&dir));
+        match result {
+            Ok(c) => {
+                for tab in &self.tabs {
+                    tab.update(cx, |t, _| t.cancel());
+                }
+                self.tabs.clear();
+                self._tab_subscriptions.clear();
+                self.active_tab = None;
+                self.collapsed.clear();
+                self.selected_folder = None;
+                self.environment = (!c.environments.is_empty()).then_some(0);
+                self.notice = (!c.issues.is_empty()).then(|| {
+                    for issue in &c.issues {
+                        log::warn!("{}", issue.error);
+                    }
+                    (
+                        format!("{} file(s) failed to load", c.issues.len()).into(),
+                        true,
+                    )
+                });
+                self.collection = Some(c);
+                self.settings.remember_collection(dir);
+                self.rebuild_sidebar();
+            }
+            Err(e) => self.notice = Some((e.to_string().into(), true)),
+        }
+        cx.notify();
+    }
+
+    /// Re-read the tree from disk, keeping tabs and the selected environment.
+    fn reload_collection(&mut self, cx: &mut Context<Self>) {
+        let Some(current) = &self.collection else {
+            return;
+        };
+        let env_name = self
+            .environment
+            .and_then(|ix| current.environments.get(ix))
+            .map(|e| e.name.clone());
+        match Collection::open(&current.root.path) {
+            Ok(c) => {
+                self.environment = env_name
+                    .and_then(|name| c.environments.iter().position(|e| e.name == name))
+                    .or((!c.environments.is_empty()).then_some(0));
+                self.collection = Some(c);
+                self.rebuild_sidebar();
+            }
+            Err(e) => self.notice = Some((e.to_string().into(), true)),
+        }
+        cx.notify();
+    }
+
+    fn pick_collection(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let paths = cx.prompt_for_paths(PathPromptOptions {
+            files: false,
+            directories: true,
+            multiple: false,
+            prompt: Some("Open Collection".into()),
+        });
+        cx.spawn_in(window, async move |this, cx| {
+            let Ok(Ok(Some(paths))) = paths.await else {
+                return;
+            };
+            let Some(dir) = paths.into_iter().next() else {
+                return;
+            };
+            this.update_in(cx, |this, window, cx| this.open_collection(dir, window, cx))
+                .ok();
+        })
+        .detach();
+    }
+
+    fn new_collection(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.prompt_name(
+            "New Collection",
+            "My Collection",
+            "Choose Location…",
+            Rc::new(|_, name, window, cx| {
+                let paths = cx.prompt_for_paths(PathPromptOptions {
+                    files: false,
+                    directories: true,
+                    multiple: false,
+                    prompt: Some("Create Collection Here".into()),
+                });
+                cx.spawn_in(window, async move |this, cx| {
+                    let Ok(Ok(Some(paths))) = paths.await else {
+                        return;
+                    };
+                    let Some(parent) = paths.into_iter().next() else {
+                        return;
+                    };
+                    this.update_in(cx, |this, window, cx| {
+                        match collection::create_collection(&parent, &name) {
+                            Ok(dir) => this.open_collection(dir, window, cx),
+                            Err(e) => {
+                                this.notice = Some((e.to_string().into(), true));
+                                cx.notify();
+                            }
+                        }
+                    })
+                    .ok();
+                })
+                .detach();
+            }),
+            window,
+            cx,
+        );
+    }
+
+    fn target_dir(&self) -> Option<PathBuf> {
+        let root = &self.collection.as_ref()?.root.path;
+        Some(
+            self.selected_folder
+                .clone()
+                .filter(|p| p.is_dir())
+                .unwrap_or_else(|| root.clone()),
+        )
+    }
+
+    fn new_request_in(&mut self, dir: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
+        self.prompt_name(
+            "New Request",
+            "New Request",
+            "Create",
+            Rc::new(
+                move |this, name, window, cx| match collection::create_request(&dir, &name) {
+                    Ok(path) => {
+                        this.reload_collection(cx);
+                        this.open_request(path, window, cx);
+                        // Deferred: the closing dialog restores the previous focus.
+                        if let Some(tab) = this.active().cloned() {
+                            window.defer(cx, move |window, cx| {
+                                tab.update(cx, |tab, cx| tab.focus_url(window, cx));
+                            });
+                        }
+                    }
+                    Err(e) => {
+                        this.notice = Some((e.to_string().into(), true));
+                        cx.notify();
+                    }
+                },
+            ),
+            window,
+            cx,
+        );
+    }
+
+    fn new_folder_in(&mut self, dir: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
+        self.prompt_name(
+            "New Folder",
+            "New Folder",
+            "Create",
+            Rc::new(
+                move |this, name, _, cx| match collection::create_folder(&dir, &name) {
+                    Ok(path) => {
+                        this.collapsed.remove(&path);
+                        this.selected_folder = Some(path);
+                        this.reload_collection(cx);
+                    }
+                    Err(e) => {
+                        this.notice = Some((e.to_string().into(), true));
+                        cx.notify();
+                    }
+                },
+            ),
+            window,
+            cx,
+        );
+    }
+
+    /// A small dialog asking for a name. Enter or the OK button confirms.
+    fn prompt_name(
+        &mut self,
+        title: &'static str,
+        default: &'static str,
+        ok_label: &'static str,
+        on_confirm: NameCallback,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let input = cx.new(|cx| InputState::new(window, cx).default_value(default));
+
+        // Enter in the input propagates to the dialog's Confirm, so `on_ok`
+        // covers both the keyboard and the button.
+        let weak = cx.entity().downgrade();
+        let focus_target = input.clone();
+        window.open_dialog(cx, move |dialog, _, _| {
+            let (input, weak, on_confirm) = (input.clone(), weak.clone(), on_confirm.clone());
+            dialog
+                .title(title)
+                .w(px(420.))
+                .child(Input::new(&input))
+                .confirm()
+                .button_props(DialogButtonProps::default().ok_text(ok_label))
+                .on_ok(move |_, window, cx| {
+                    let name = input.read(cx).value().trim().to_owned();
+                    if name.is_empty() {
+                        return false;
+                    }
+                    weak.update(cx, |this, cx| on_confirm(this, name, window, cx))
+                        .ok();
+                    true
+                })
+        });
+        // The dialog takes focus when it opens; hand it to the input after.
+        window.defer(cx, move |window, cx| {
+            focus_target.update(cx, |input, cx| input.focus(window, cx));
+        });
+    }
 
     fn rebuild_sidebar(&mut self) {
         fn flatten(
@@ -231,51 +365,84 @@ impl Workspace {
         }
     }
 
-    fn toggle_folder(&mut self, path: &Path, cx: &mut Context<Self>) {
+    fn click_folder(&mut self, path: &Path, cx: &mut Context<Self>) {
         if !self.collapsed.remove(path) {
             self.collapsed.insert(path.to_path_buf());
         }
+        self.selected_folder = Some(path.to_path_buf());
         self.rebuild_sidebar();
         cx.notify();
     }
 
-    fn active(&self) -> Option<&RequestTab> {
+    // -- tabs ------------------------------------------------------------------
+
+    fn active(&self) -> Option<&Entity<RequestEditor>> {
         self.active_tab.and_then(|ix| self.tabs.get(ix))
     }
 
-    fn active_mut(&mut self) -> Option<&mut RequestTab> {
-        self.active_tab.and_then(|ix| self.tabs.get_mut(ix))
-    }
-
-    fn open_request(&mut self, path: PathBuf, cx: &mut Context<Self>) {
-        if let Some(ix) = self.tabs.iter().position(|t| t.path == path) {
+    fn open_request(&mut self, path: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
+        // New items go next to the request the user is looking at.
+        self.selected_folder = path.parent().map(Path::to_path_buf);
+        if let Some(ix) = self.tabs.iter().position(|t| t.read(cx).path() == &path) {
             self.active_tab = Some(ix);
-        } else {
-            match collection::load_request(&path) {
-                Ok(request) => {
-                    self.tabs.push(RequestTab {
-                        path,
-                        saved: request.clone(),
-                        request,
-                        editor_tab: EditorTab::Params,
-                        response_tab: ResponseTab::Body,
-                        response: ResponseState::Idle,
+            cx.notify();
+            return;
+        }
+        match collection::load_request(&path) {
+            Ok(request) => {
+                let editor = cx.new(|cx| RequestEditor::new(path, request, window, cx));
+                let subscription =
+                    cx.subscribe_in(&editor, window, |this, editor, event, _, cx| match event {
+                        EditorEvent::Changed => cx.notify(),
+                        EditorEvent::SendRequested => this.send(editor.clone(), cx),
                     });
-                    self.active_tab = Some(self.tabs.len() - 1);
-                }
-                Err(e) => self.notice = Some((e.to_string().into(), true)),
+                self._tab_subscriptions
+                    .push((editor.entity_id(), subscription));
+                self.tabs.push(editor);
+                self.active_tab = Some(self.tabs.len() - 1);
             }
+            Err(e) => self.notice = Some((e.to_string().into(), true)),
         }
         cx.notify();
     }
 
-    fn close_tab_at(&mut self, ix: usize, cx: &mut Context<Self>) {
-        if ix >= self.tabs.len() {
+    fn close_tab_at(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(tab) = self.tabs.get(ix).cloned() else {
             return;
+        };
+        if tab.read(cx).is_dirty() {
+            let weak = cx.entity().downgrade();
+            let name = tab.read(cx).title();
+            window.open_dialog(cx, move |dialog, _, _| {
+                let (weak, tab) = (weak.clone(), tab.clone());
+                dialog
+                    .title(format!("Discard changes to “{name}”?"))
+                    .w(px(420.))
+                    .child(
+                        div()
+                            .text_sm()
+                            .text_color(c(theme::TEXT_MUTED))
+                            .child("Your unsaved edits to this request will be lost."),
+                    )
+                    .confirm()
+                    .button_props(DialogButtonProps::default().ok_text("Discard"))
+                    .on_ok(move |_, _, cx| {
+                        weak.update(cx, |this, cx| this.force_close(&tab, cx)).ok();
+                        true
+                    })
+            });
+        } else {
+            self.force_close(&tab, cx);
         }
-        if let ResponseState::Loading { canceller, .. } = &self.tabs[ix].response {
-            canceller.cancel();
-        }
+    }
+
+    fn force_close(&mut self, tab: &Entity<RequestEditor>, cx: &mut Context<Self>) {
+        let Some(ix) = self.tabs.iter().position(|t| t == tab) else {
+            return;
+        };
+        tab.update(cx, |t, _| t.cancel());
+        let id = tab.entity_id();
+        self._tab_subscriptions.retain(|(eid, _)| *eid != id);
         self.tabs.remove(ix);
         self.active_tab = match self.active_tab {
             _ if self.tabs.is_empty() => None,
@@ -303,97 +470,41 @@ impl Workspace {
             .map_or_else(|| "No Environment".into(), |e| e.name.clone().into())
     }
 
-    fn cycle_method(&mut self, cx: &mut Context<Self>) {
-        if let Some(tab) = self.active_mut() {
-            let all = HttpMethod::ALL;
-            let ix = all
-                .iter()
-                .position(|m| *m == tab.request.method)
-                .unwrap_or(0);
-            tab.request.method = all[(ix + 1) % all.len()];
-            cx.notify();
-        }
-    }
-
-    // -- actions -------------------------------------------------------------
-
-    fn send_request(&mut self, _: &SendRequest, _: &mut Window, cx: &mut Context<Self>) {
+    fn send(&mut self, editor: Entity<RequestEditor>, cx: &mut Context<Self>) {
         let scope = self.var_scope();
-        let id = self.next_request_id;
-        self.next_request_id += 1;
         let engine = self.engine.clone();
-        let Some(tab) = self.active_mut() else { return };
-
-        if let ResponseState::Loading { canceller, .. } = &tab.response {
-            // Second press cancels, like the button.
-            canceller.cancel();
-            tab.response = ResponseState::Idle;
-            cx.notify();
-            return;
-        }
-
-        let handle = engine.send(&tab.request, &scope);
-        tab.response = ResponseState::Loading {
-            id,
-            canceller: handle.canceller(),
-        };
-        let path = tab.path.clone();
-        cx.notify();
-
-        cx.spawn(async move |this, cx| {
-            let state = match handle.response().await {
-                Ok(response) => {
-                    // Pretty-print + highlight off the UI thread.
-                    let view = cx
-                        .background_executor()
-                        .spawn(async move { ResponseView::build(response) })
-                        .await;
-                    ResponseState::Ready(Arc::new(view))
-                }
-                Err(NetError::Cancelled) => ResponseState::Idle,
-                Err(e) => ResponseState::Failed(e.to_string().into()),
-            };
-            this.update(cx, |this, cx| {
-                let tab = this.tabs.iter_mut().find(|t| t.path == path);
-                if let Some(tab) = tab {
-                    // Ignore results of requests that were superseded.
-                    if matches!(tab.response, ResponseState::Loading { id: current, .. } if current == id)
-                    {
-                        tab.response = state;
-                        cx.notify();
-                    }
-                }
-            })
-            .ok();
-        })
-        .detach();
+        editor.update(cx, |editor, cx| editor.send(&engine, scope, cx));
     }
 
-    fn save_request(&mut self, _: &SaveRequest, _: &mut Window, cx: &mut Context<Self>) {
-        let Some(tab) = self.active_mut() else { return };
-        match collection::save_request(&tab.path, &tab.request) {
+    // -- actions ---------------------------------------------------------------
+
+    fn on_send(&mut self, _: &SendRequest, _: &mut Window, cx: &mut Context<Self>) {
+        if let Some(tab) = self.active().cloned() {
+            self.send(tab, cx);
+        }
+    }
+
+    fn on_save(&mut self, _: &SaveRequest, _: &mut Window, cx: &mut Context<Self>) {
+        let Some(tab) = self.active().cloned() else {
+            return;
+        };
+        match tab.update(cx, |t, cx| t.save(cx)) {
             Ok(()) => {
-                tab.saved = tab.request.clone();
-                let (path, method) = (tab.path.clone(), tab.request.method);
-                let name = tab.title();
-                if let Some(c) = &mut self.collection {
-                    update_summary(&mut c.root, &path, method);
-                }
-                self.rebuild_sidebar();
-                self.notice = Some((format!("Saved {name}").into(), false));
+                self.notice = Some((format!("Saved {}", tab.read(cx).title()).into(), false));
+                self.reload_collection(cx);
             }
             Err(e) => self.notice = Some((e.to_string().into(), true)),
         }
         cx.notify();
     }
 
-    fn close_tab(&mut self, _: &CloseTab, _: &mut Window, cx: &mut Context<Self>) {
+    fn on_close_tab(&mut self, _: &CloseTab, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(ix) = self.active_tab {
-            self.close_tab_at(ix, cx);
+            self.close_tab_at(ix, window, cx);
         }
     }
 
-    fn next_environment(&mut self, _: &NextEnvironment, _: &mut Window, cx: &mut Context<Self>) {
+    fn on_next_environment(&mut self, _: &NextEnvironment, _: &mut Window, cx: &mut Context<Self>) {
         let count = self.collection.as_ref().map_or(0, |c| c.environments.len());
         // Cycles through every environment and then "No Environment".
         self.environment = match self.environment {
@@ -404,7 +515,38 @@ impl Workspace {
         cx.notify();
     }
 
-    fn toggle_palette(
+    fn on_new_request(&mut self, _: &NewRequest, window: &mut Window, cx: &mut Context<Self>) {
+        match self.target_dir() {
+            Some(dir) => self.new_request_in(dir, window, cx),
+            None => self.pick_collection(window, cx),
+        }
+    }
+
+    fn on_new_folder(&mut self, _: &NewFolder, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(dir) = self.target_dir() {
+            self.new_folder_in(dir, window, cx);
+        }
+    }
+
+    fn on_open_collection(
+        &mut self,
+        _: &OpenCollection,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.pick_collection(window, cx);
+    }
+
+    fn on_new_collection(
+        &mut self,
+        _: &NewCollection,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.new_collection(window, cx);
+    }
+
+    fn on_toggle_palette(
         &mut self,
         _: &ToggleCommandPalette,
         window: &mut Window,
@@ -415,6 +557,8 @@ impl Workspace {
             return;
         }
         let Some(collection) = &self.collection else {
+            // Nothing to search yet: the most useful thing is to open one.
+            self.pick_collection(window, cx);
             return;
         };
         let root = collection.root.path.clone();
@@ -434,14 +578,13 @@ impl Workspace {
             })
             .collect();
 
-        let palette = cx.new(|cx| CommandPalette::new(items, cx));
+        let palette = cx.new(|cx| CommandPalette::new(items, window, cx));
         let subscription = cx.subscribe_in(&palette, window, |this, _, event, window, cx| {
             if let PaletteEvent::Confirmed(path) = event {
-                this.open_request(path.clone(), cx);
+                this.open_request(path.clone(), window, cx);
             }
             this.dismiss_palette(window, cx);
         });
-        window.focus(&palette.focus_handle(cx));
         self.palette = Some((palette, subscription));
         cx.notify();
     }
@@ -452,13 +595,109 @@ impl Workspace {
         cx.notify();
     }
 
-    // -- rendering -----------------------------------------------------------
+    // -- rendering -------------------------------------------------------------
+
+    fn render_welcome(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let recent: Vec<PathBuf> = self
+            .settings
+            .recent_collections
+            .iter()
+            .filter(|p| p.is_dir())
+            .cloned()
+            .collect();
+        div()
+            .size_full()
+            .flex()
+            .items_center()
+            .justify_center()
+            .child(
+                div()
+                    .w(px(460.))
+                    .flex()
+                    .flex_col()
+                    .gap_4()
+                    .child(div().text_2xl().child("Davi"))
+                    .child(
+                        div()
+                            .text_sm()
+                            .text_color(c(theme::TEXT_MUTED))
+                            .child("A fast, Git-friendly API client. Collections are folders of plain-text .bru files, compatible with Bruno."),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .gap_2()
+                            .child(button("welcome-new", "New Collection", true).on_click(
+                                cx.listener(|this, _, window, cx| this.new_collection(window, cx)),
+                            ))
+                            .child(button("welcome-open", "Open Collection…", false).on_click(
+                                cx.listener(|this, _, window, cx| this.pick_collection(window, cx)),
+                            )),
+                    )
+                    .when(!recent.is_empty(), |el| {
+                        el.child(
+                            div()
+                                .mt_4()
+                                .flex()
+                                .flex_col()
+                                .gap_1()
+                                .child(div().text_xs().text_color(c(theme::TEXT_FAINT)).child("RECENT"))
+                                .children(recent.into_iter().enumerate().map(|(ix, path)| {
+                                    let label: SharedString = path.display().to_string().into();
+                                    div()
+                                        .id(("recent", ix))
+                                        .px_2()
+                                        .py_1()
+                                        .rounded_md()
+                                        .cursor_pointer()
+                                        .text_sm()
+                                        .text_color(c(theme::ACCENT))
+                                        .hover(|s| s.bg(c(theme::ELEVATED)))
+                                        .on_click(cx.listener(move |this, _, window, cx| {
+                                            this.open_collection(path.clone(), window, cx)
+                                        }))
+                                        .child(label)
+                                })),
+                        )
+                    })
+                    .when_some(self.notice.clone(), |el, (msg, _)| {
+                        el.child(div().text_sm().text_color(c(theme::ERROR)).child(msg))
+                    })
+                    .child(
+                        div()
+                            .mt_4()
+                            .text_xs()
+                            .text_color(c(theme::TEXT_FAINT))
+                            .child(format!(
+                                "{} open collection  ·  {} new request  ·  {} search",
+                                shortcut("O"),
+                                shortcut("N"),
+                                shortcut("P")
+                            )),
+                    ),
+            )
+    }
 
     fn render_sidebar(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let title: SharedString = self
             .collection
             .as_ref()
             .map_or_else(|| "No collection".into(), |c| c.name.clone().into());
+
+        let header_button = |id: &'static str, label: &'static str, tooltip: &'static str| {
+            div()
+                .id(id)
+                .px_1p5()
+                .rounded_sm()
+                .cursor_pointer()
+                .text_xs()
+                .text_color(c(theme::TEXT_MUTED))
+                .hover(|s| s.bg(c(theme::ELEVATED)).text_color(c(theme::TEXT)))
+                .child(label)
+                .tooltip(move |window, cx| {
+                    gpui_component::tooltip::Tooltip::new(tooltip).build(window, cx)
+                })
+        };
 
         div()
             .w(px(SIDEBAR_WIDTH))
@@ -471,34 +710,84 @@ impl Workspace {
             .border_color(c(theme::BORDER))
             .child(
                 div()
-                    .px_3()
-                    .py_2()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .gap_1()
+                    .pl_3()
+                    .pr_2()
+                    .h(px(36.))
                     .border_b_1()
                     .border_color(c(theme::BORDER))
-                    .text_xs()
-                    .text_color(c(theme::TEXT_MUTED))
-                    .child(title.to_uppercase()),
+                    .child(
+                        div()
+                            .id("collection-title")
+                            .flex_1()
+                            .min_w_0()
+                            .truncate()
+                            .cursor_pointer()
+                            .text_xs()
+                            .text_color(c(theme::TEXT_MUTED))
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.selected_folder = None;
+                                cx.notify();
+                            }))
+                            .child(title.to_uppercase()),
+                    )
+                    .child(
+                        header_button("new-request", "+ Request", "New request (Ctrl+N)").on_click(
+                            cx.listener(|this, _, window, cx| {
+                                this.on_new_request(&NewRequest, window, cx)
+                            }),
+                        ),
+                    )
+                    .child(
+                        header_button("new-folder", "+ Folder", "New folder").on_click(
+                            cx.listener(|this, _, window, cx| {
+                                this.on_new_folder(&NewFolder, window, cx)
+                            }),
+                        ),
+                    )
+                    .child(
+                        header_button("switch-collection", "⇄", "Open another collection (Ctrl+O)")
+                            .on_click(
+                                cx.listener(|this, _, window, cx| this.pick_collection(window, cx)),
+                            ),
+                    ),
             )
             .child(
-                div().flex_1().min_h_0().child(
-                    uniform_list(
-                        "sidebar",
-                        self.sidebar_rows.len(),
-                        cx.processor(|this, range: std::ops::Range<usize>, _, cx| {
-                            range
-                                .map(|ix| this.render_sidebar_row(ix, cx))
-                                .collect::<Vec<_>>()
-                        }),
-                    )
-                    .size_full(),
-                ),
+                div()
+                    .flex_1()
+                    .min_h_0()
+                    .when(self.sidebar_rows.is_empty(), |el| {
+                        el.child(
+                            div()
+                                .p_4()
+                                .text_sm()
+                                .text_color(c(theme::TEXT_FAINT))
+                                .child("No requests yet. Click “+ Request” to create one."),
+                        )
+                    })
+                    .child(
+                        uniform_list(
+                            "sidebar",
+                            self.sidebar_rows.len(),
+                            cx.processor(|this, range: std::ops::Range<usize>, _, cx| {
+                                range
+                                    .map(|ix| this.render_sidebar_row(ix, cx))
+                                    .collect::<Vec<_>>()
+                            }),
+                        )
+                        .size_full(),
+                    ),
             )
     }
 
     fn render_sidebar_row(&self, ix: usize, cx: &mut Context<Self>) -> Stateful<Div> {
-        let active_path = self.active().map(|t| t.path.as_path());
+        let active_path = self.active().map(|t| t.read(cx).path().clone());
         let row = div()
             .id(ix)
+            .group("sidebar-row")
             .w_full()
             .flex()
             .items_center()
@@ -516,17 +805,36 @@ impl Workspace {
                 depth,
                 collapsed,
             } => {
-                let path = path.clone();
+                let is_selected = self.selected_folder.as_deref() == Some(path.as_path());
+                let (toggle_path, add_path) = (path.clone(), path.clone());
                 row.pl(px(12. + *depth as f32 * 14.))
+                    .when(is_selected, |el| el.bg(c(theme::ELEVATED)))
                     .text_color(c(theme::TEXT))
-                    .on_click(cx.listener(move |this, _, _, cx| this.toggle_folder(&path, cx)))
+                    .on_click(
+                        cx.listener(move |this, _, _, cx| this.click_folder(&toggle_path, cx)),
+                    )
                     .child(
                         div()
                             .w(px(12.))
                             .text_color(c(theme::TEXT_FAINT))
                             .child(if *collapsed { "▸" } else { "▾" }),
                     )
-                    .child(name.clone())
+                    .child(div().flex_1().min_w_0().truncate().child(name.clone()))
+                    .child(
+                        div()
+                            .id(("folder-add", ix))
+                            .invisible()
+                            .group_hover("sidebar-row", |s| s.visible())
+                            .px_1()
+                            .rounded_sm()
+                            .text_color(c(theme::TEXT_MUTED))
+                            .hover(|s| s.bg(c(theme::HOVER)))
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                cx.stop_propagation();
+                                this.new_request_in(add_path.clone(), window, cx);
+                            }))
+                            .child("+"),
+                    )
             }
             SidebarRow::Request {
                 path,
@@ -534,14 +842,14 @@ impl Workspace {
                 method,
                 depth,
             } => {
-                let is_active = active_path == Some(path.as_path());
+                let is_active = active_path.as_ref() == Some(path);
                 let path = path.clone();
                 row.pl(px(12. + *depth as f32 * 14.))
                     .when(is_active, |el| el.bg(c(theme::ELEVATED)))
                     .text_color(c(theme::TEXT))
-                    .on_click(
-                        cx.listener(move |this, _, _, cx| this.open_request(path.clone(), cx)),
-                    )
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.open_request(path.clone(), window, cx)
+                    }))
                     .child(
                         div()
                             .w(px(36.))
@@ -566,11 +874,11 @@ impl Workspace {
             .border_b_1()
             .border_color(c(theme::BORDER))
             .children(self.tabs.iter().enumerate().map(|(ix, tab)| {
+                let tab = tab.read(cx);
                 let active = self.active_tab == Some(ix);
                 let dirty = tab.is_dirty();
                 div()
                     .id(ix)
-                    .group("tab")
                     .flex()
                     .items_center()
                     .gap_2()
@@ -592,8 +900,8 @@ impl Workspace {
                     .child(
                         div()
                             .text_xs()
-                            .text_color(theme::method_color(tab.request.method))
-                            .child(theme::method_label(tab.request.method)),
+                            .text_color(theme::method_color(tab.method()))
+                            .child(theme::method_label(tab.method())),
                     )
                     .child(
                         div()
@@ -606,7 +914,6 @@ impl Workspace {
                             .child(tab.title()),
                     )
                     .child(
-                        // Dirty tabs show a dot that turns into a close button on hover.
                         div()
                             .id(("close", ix))
                             .w(px(16.))
@@ -619,325 +926,13 @@ impl Workspace {
                                 theme::TEXT_FAINT
                             }))
                             .hover(|s| s.bg(c(theme::HOVER)))
-                            .on_click(cx.listener(move |this, _, _, cx| {
+                            .on_click(cx.listener(move |this, _, window, cx| {
                                 cx.stop_propagation();
-                                this.close_tab_at(ix, cx);
+                                this.close_tab_at(ix, window, cx);
                             }))
                             .child(if dirty { "●" } else { "×" }),
                     )
             }))
-    }
-
-    fn render_request_panel(&self, tab: &RequestTab, cx: &mut Context<Self>) -> impl IntoElement {
-        let loading = matches!(tab.response, ResponseState::Loading { .. });
-        let req = &tab.request;
-
-        let url_bar = div()
-            .flex()
-            .items_center()
-            .gap_2()
-            .p_2()
-            .border_b_1()
-            .border_color(c(theme::BORDER))
-            .child(
-                div()
-                    .id("method")
-                    .flex_none()
-                    .w(px(84.))
-                    .py_1()
-                    .flex()
-                    .justify_center()
-                    .rounded_md()
-                    .bg(c(theme::SURFACE))
-                    .border_1()
-                    .border_color(c(theme::BORDER))
-                    .cursor_pointer()
-                    .hover(|s| s.border_color(c(theme::HOVER)))
-                    .text_sm()
-                    .text_color(theme::method_color(req.method))
-                    .on_click(cx.listener(|this, _, _, cx| this.cycle_method(cx)))
-                    .child(req.method.as_str()),
-            )
-            .child(
-                div()
-                    .flex_1()
-                    .min_w_0()
-                    .px_2()
-                    .py_1()
-                    .rounded_md()
-                    .bg(c(theme::SURFACE_ALT))
-                    .border_1()
-                    .border_color(c(theme::BORDER))
-                    .font_family(theme::MONO_FONT)
-                    .text_sm()
-                    .truncate()
-                    .child(SharedString::from(req.url.clone())),
-            )
-            .child(
-                div()
-                    .id("send")
-                    .flex_none()
-                    .px_4()
-                    .py_1()
-                    .rounded_md()
-                    .cursor_pointer()
-                    .text_sm()
-                    .bg(c(if loading { theme::ERROR } else { theme::ACCENT }))
-                    .text_color(c(theme::SURFACE_ALT))
-                    .hover(|s| s.opacity(0.85))
-                    .on_click(cx.listener(|this, _, window, cx| {
-                        this.send_request(&SendRequest, window, cx)
-                    }))
-                    .child(if loading { "Cancel" } else { "Send" }),
-            );
-
-        let counts = |t: EditorTab| -> usize {
-            let enabled = |kvs: &[KeyValue]| kvs.iter().filter(|kv| kv.enabled).count();
-            match t {
-                EditorTab::Params => enabled(&req.query_params) + enabled(&req.path_params),
-                EditorTab::Headers => enabled(&req.headers),
-                EditorTab::Vars => {
-                    enabled(&req.vars.pre_request) + enabled(&req.vars.post_response)
-                }
-                EditorTab::Auth | EditorTab::Body => 0,
-            }
-        };
-        let editor_tabs = div()
-            .flex()
-            .gap_4()
-            .px_3()
-            .border_b_1()
-            .border_color(c(theme::BORDER))
-            .children(EditorTab::ALL.into_iter().map(|t| {
-                let selected = tab.editor_tab == t;
-                let count = counts(t);
-                div()
-                    .id(t.label())
-                    .py_2()
-                    .cursor_pointer()
-                    .text_sm()
-                    .text_color(c(if selected {
-                        theme::TEXT
-                    } else {
-                        theme::TEXT_MUTED
-                    }))
-                    .when(selected, |el| {
-                        el.border_b_2().border_color(c(theme::ACCENT))
-                    })
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        if let Some(tab) = this.active_mut() {
-                            tab.editor_tab = t;
-                            cx.notify();
-                        }
-                    }))
-                    .child(if count > 0 {
-                        format!("{} {count}", t.label())
-                    } else {
-                        t.label().to_owned()
-                    })
-            }));
-
-        let content: AnyElement = match tab.editor_tab {
-            EditorTab::Params => div()
-                .flex()
-                .flex_col()
-                .gap_3()
-                .child(section("Query", kv_table(&req.query_params)))
-                .when(!req.path_params.is_empty(), |el| {
-                    el.child(section("Path", kv_table(&req.path_params)))
-                })
-                .into_any_element(),
-            EditorTab::Headers => kv_table(&req.headers),
-            EditorTab::Auth => render_auth(&req.auth),
-            EditorTab::Body => render_body(req),
-            EditorTab::Vars => div()
-                .flex()
-                .flex_col()
-                .gap_3()
-                .child(section("Pre Request", kv_table(&req.vars.pre_request)))
-                .child(section("Post Response", kv_table(&req.vars.post_response)))
-                .into_any_element(),
-        };
-
-        div()
-            .flex_1()
-            .min_w_0()
-            .h_full()
-            .flex()
-            .flex_col()
-            .border_r_1()
-            .border_color(c(theme::BORDER))
-            .child(url_bar)
-            .child(editor_tabs)
-            .child(
-                div()
-                    .id("request-content")
-                    .flex_1()
-                    .min_h_0()
-                    .overflow_y_scroll()
-                    .p_3()
-                    .child(content),
-            )
-    }
-
-    fn render_response_panel(&self, tab: &RequestTab, cx: &mut Context<Self>) -> impl IntoElement {
-        let panel = div().flex_1().min_w_0().h_full().flex().flex_col();
-
-        let view = match &tab.response {
-            ResponseState::Idle => {
-                return panel.child(placeholder(format!(
-                    "Press {} to send the request",
-                    shortcut("Enter")
-                )));
-            }
-            ResponseState::Loading { .. } => return panel.child(placeholder("Sending…".into())),
-            ResponseState::Failed(error) => {
-                return panel.child(
-                    div()
-                        .p_4()
-                        .flex()
-                        .flex_col()
-                        .gap_2()
-                        .child(div().text_color(c(theme::ERROR)).child("Request failed"))
-                        .child(
-                            div()
-                                .font_family(theme::MONO_FONT)
-                                .text_sm()
-                                .text_color(c(theme::TEXT_MUTED))
-                                .child(error.clone()),
-                        ),
-                );
-            }
-            ResponseState::Ready(view) => view.clone(),
-        };
-
-        let metric = |label: &'static str, value: SharedString| {
-            div()
-                .flex()
-                .gap_1()
-                .text_sm()
-                .child(div().text_color(c(theme::TEXT_FAINT)).child(label))
-                .child(value)
-        };
-        let header = div()
-            .flex()
-            .items_center()
-            .gap_4()
-            .px_3()
-            .h(px(45.))
-            .flex_none()
-            .border_b_1()
-            .border_color(c(theme::BORDER))
-            .child(
-                div()
-                    .px_2()
-                    .rounded_sm()
-                    .text_sm()
-                    .text_color(theme::status_color(view.status))
-                    .bg(c(theme::SURFACE))
-                    .child(view.status_text.clone()),
-            )
-            .child(metric("Time", view.time.clone()))
-            .child(metric("Size", view.size.clone()))
-            .when(view.truncated, |el| {
-                el.child(
-                    div()
-                        .text_xs()
-                        .text_color(c(theme::WARNING))
-                        .child("truncated"),
-                )
-            });
-
-        let tabs = div()
-            .flex()
-            .gap_4()
-            .px_3()
-            .border_b_1()
-            .border_color(c(theme::BORDER))
-            .children(
-                [
-                    (ResponseTab::Body, "Body".to_owned()),
-                    (
-                        ResponseTab::Headers,
-                        format!("Headers {}", view.headers.len()),
-                    ),
-                ]
-                .into_iter()
-                .map(|(t, label)| {
-                    let selected = tab.response_tab == t;
-                    div()
-                        .id(SharedString::from(format!("response-tab-{label}")))
-                        .py_2()
-                        .cursor_pointer()
-                        .text_sm()
-                        .text_color(c(if selected {
-                            theme::TEXT
-                        } else {
-                            theme::TEXT_MUTED
-                        }))
-                        .when(selected, |el| {
-                            el.border_b_2().border_color(c(theme::ACCENT))
-                        })
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            if let Some(tab) = this.active_mut() {
-                                tab.response_tab = t;
-                                cx.notify();
-                            }
-                        }))
-                        .child(label)
-                }),
-            );
-
-        let body: AnyElement = match tab.response_tab {
-            ResponseTab::Body => {
-                let lines = view.lines.clone();
-                // Virtualized: only visible lines are laid out, so multi-MB
-                // responses scroll as smoothly as tiny ones.
-                uniform_list("response-body", lines.len(), move |range, _, _| {
-                    range
-                        .map(|ix| {
-                            let line = &lines[ix];
-                            div().whitespace_nowrap().child(
-                                StyledText::new(line.text.clone())
-                                    .with_highlights(line.highlights.iter().cloned()),
-                            )
-                        })
-                        .collect()
-                })
-                .size_full()
-                .px_3()
-                .py_2()
-                .font_family(theme::MONO_FONT)
-                .text_sm()
-                .into_any_element()
-            }
-            ResponseTab::Headers => div()
-                .id("response-headers")
-                .size_full()
-                .overflow_y_scroll()
-                .p_3()
-                .children(view.headers.iter().map(|(k, v)| {
-                    div()
-                        .flex()
-                        .gap_3()
-                        .py_0p5()
-                        .text_sm()
-                        .child(
-                            div()
-                                .w(px(200.))
-                                .flex_none()
-                                .text_color(c(theme::SYN_KEY))
-                                .child(k.clone()),
-                        )
-                        .child(div().min_w_0().child(v.clone()))
-                }))
-                .into_any_element(),
-        };
-
-        panel
-            .child(header)
-            .child(tabs)
-            .child(div().flex_1().min_h_0().child(body))
     }
 
     fn render_status_bar(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -965,9 +960,9 @@ impl Workspace {
                             .cursor_pointer()
                             .hover(|s| s.text_color(c(theme::TEXT)))
                             .on_click(cx.listener(|this, _, window, cx| {
-                                this.next_environment(&NextEnvironment, window, cx)
+                                this.on_next_environment(&NextEnvironment, window, cx)
                             }))
-                            .child(format!("⚙ {}", self.environment_name())),
+                            .child(format!("Env: {}", self.environment_name())),
                     )
                     .when_some(self.notice.clone(), |el, (msg, is_error)| {
                         el.child(
@@ -982,8 +977,9 @@ impl Workspace {
                     }),
             )
             .child(format!(
-                "{} Search  ·  {} Send  ·  {} Save",
+                "{} Search  ·  {} New  ·  {} Send  ·  {} Save",
                 shortcut("P"),
+                shortcut("N"),
                 shortcut("Enter"),
                 shortcut("S")
             ))
@@ -991,30 +987,71 @@ impl Workspace {
 }
 
 impl Render for Workspace {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let main: AnyElement = match self.active() {
-            Some(tab) => div()
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // Global shortcuts dispatch along the focus path, so never leave the
+        // window without focus (e.g. after a dialog closes).
+        if window.focused(cx).is_none() {
+            let handle = self.focus_handle.clone();
+            window.defer(cx, move |window, _| window.focus(&handle));
+        }
+
+        let body: AnyElement = if self.collection.is_none() {
+            self.render_welcome(cx).into_any_element()
+        } else {
+            let main: AnyElement = match self.active() {
+                Some(tab) => div()
+                    .flex_1()
+                    .min_h_0()
+                    .child(tab.clone())
+                    .into_any_element(),
+                None => div()
+                    .flex_1()
+                    .flex()
+                    .flex_col()
+                    .items_center()
+                    .justify_center()
+                    .gap_3()
+                    .text_color(c(theme::TEXT_FAINT))
+                    .child(format!(
+                        "Open a request from the sidebar, press {} to search, or",
+                        shortcut("P")
+                    ))
+                    .child(
+                        button("empty-new-request", "New Request", true).on_click(cx.listener(
+                            |this, _, window, cx| this.on_new_request(&NewRequest, window, cx),
+                        )),
+                    )
+                    .into_any_element(),
+            };
+            div()
                 .flex_1()
                 .min_h_0()
                 .flex()
-                .child(self.render_request_panel(tab, cx))
-                .child(self.render_response_panel(tab, cx))
-                .into_any_element(),
-            None => placeholder(format!(
-                "Open a request from the sidebar or press {}",
-                shortcut("P")
-            ))
-            .into_any_element(),
+                .child(self.render_sidebar(cx))
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .flex()
+                        .flex_col()
+                        .child(self.render_tab_bar(cx))
+                        .child(main),
+                )
+                .into_any_element()
         };
 
         div()
             .track_focus(&self.focus_handle)
             .key_context("Workspace")
-            .on_action(cx.listener(Self::toggle_palette))
-            .on_action(cx.listener(Self::send_request))
-            .on_action(cx.listener(Self::save_request))
-            .on_action(cx.listener(Self::close_tab))
-            .on_action(cx.listener(Self::next_environment))
+            .on_action(cx.listener(Self::on_toggle_palette))
+            .on_action(cx.listener(Self::on_send))
+            .on_action(cx.listener(Self::on_save))
+            .on_action(cx.listener(Self::on_close_tab))
+            .on_action(cx.listener(Self::on_next_environment))
+            .on_action(cx.listener(Self::on_new_request))
+            .on_action(cx.listener(Self::on_new_folder))
+            .on_action(cx.listener(Self::on_open_collection))
+            .on_action(cx.listener(Self::on_new_collection))
             .size_full()
             .relative()
             .flex()
@@ -1022,22 +1059,7 @@ impl Render for Workspace {
             .bg(c(theme::BG))
             .text_color(c(theme::TEXT))
             .text_sm()
-            .child(
-                div()
-                    .flex_1()
-                    .min_h_0()
-                    .flex()
-                    .child(self.render_sidebar(cx))
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w_0()
-                            .flex()
-                            .flex_col()
-                            .child(self.render_tab_bar(cx))
-                            .child(main),
-                    ),
-            )
+            .child(div().flex_1().min_h_0().flex().child(body))
             .child(self.render_status_bar(cx))
             .when_some(self.palette.as_ref(), |el, (palette, _)| {
                 el.child(
@@ -1046,6 +1068,7 @@ impl Render for Workspace {
                         .inset_0()
                         .flex()
                         .justify_center()
+                        .items_start()
                         .pt(px(72.))
                         .bg(gpui::hsla(0., 0., 0., 0.35))
                         .on_mouse_down(
@@ -1055,161 +1078,29 @@ impl Render for Workspace {
                         .child(palette.clone()),
                 )
             })
+            .children(Root::render_dialog_layer(window, cx))
+            .children(Root::render_notification_layer(window, cx))
     }
 }
 
-// -- small stateless helpers -------------------------------------------------
-
-fn shortcut(key: &str) -> String {
-    if cfg!(target_os = "macos") {
-        format!("⌘{key}")
-    } else {
-        format!("Ctrl+{key}")
-    }
-}
-
-fn placeholder(text: String) -> Div {
+fn button(id: &'static str, label: &'static str, primary: bool) -> Stateful<Div> {
     div()
-        .flex_1()
-        .size_full()
-        .flex()
-        .items_center()
-        .justify_center()
-        .text_color(c(theme::TEXT_FAINT))
-        .child(text)
-}
-
-fn kv_table(entries: &[KeyValue]) -> AnyElement {
-    if entries.is_empty() {
-        return div()
-            .text_color(c(theme::TEXT_FAINT))
-            .child("None")
-            .into_any_element();
-    }
-    div()
-        .flex()
-        .flex_col()
-        .border_1()
-        .border_color(c(theme::BORDER))
+        .id(id)
+        .px_4()
+        .py_1p5()
         .rounded_md()
-        .children(entries.iter().map(|kv| {
-            div()
-                .flex()
-                .border_b_1()
-                .border_color(c(theme::BORDER))
-                .font_family(theme::MONO_FONT)
-                .text_sm()
-                .when(!kv.enabled, |el| {
-                    el.text_color(c(theme::TEXT_FAINT)).line_through()
-                })
-                .child(
-                    div()
-                        .w(px(180.))
-                        .flex_none()
-                        .px_2()
-                        .py_1()
-                        .border_r_1()
-                        .border_color(c(theme::BORDER))
-                        .truncate()
-                        .child(SharedString::from(kv.name.clone())),
-                )
-                .child(
-                    div()
-                        .flex_1()
-                        .min_w_0()
-                        .px_2()
-                        .py_1()
-                        .truncate()
-                        .child(SharedString::from(kv.value.clone())),
-                )
-        }))
-        .into_any_element()
-}
-
-fn render_auth(auth: &Auth) -> AnyElement {
-    let field = |k: &str, v: &str| KeyValue::new(k, v);
-    let mask = |s: &str| "•".repeat(s.chars().count().min(16));
-    let (mode, fields) = match auth {
-        Auth::None => ("No Auth", vec![]),
-        Auth::Inherit => ("Inherit from collection", vec![]),
-        Auth::Bearer { token } => ("Bearer Token", vec![field("Token", token)]),
-        Auth::Basic { username, password } => (
-            "Basic Auth",
-            vec![
-                field("Username", username),
-                field("Password", &mask(password)),
-            ],
-        ),
-        Auth::ApiKey {
-            key,
-            value,
-            placement,
-        } => (
-            "API Key",
-            vec![
-                field("Key", key),
-                field("Value", value),
-                field("Add to", placement.as_str()),
-            ],
-        ),
-        Auth::Unsupported { mode } => (mode.as_str(), vec![]),
-    };
-    section(mode, kv_table(&fields))
-}
-
-fn render_body(req: &HttpRequest) -> AnyElement {
-    let body = &req.body;
-    let text_block = |text: &Option<String>| -> AnyElement {
-        div()
-            .p_2()
-            .rounded_md()
-            .bg(c(theme::SURFACE_ALT))
-            .border_1()
-            .border_color(c(theme::BORDER))
-            .font_family(theme::MONO_FONT)
-            .text_sm()
-            .children(text.as_deref().unwrap_or_default().lines().map(|l| {
-                div()
-                    .whitespace_nowrap()
-                    .child(SharedString::from(l.to_owned()))
-            }))
-            .into_any_element()
-    };
-    let content = match &body.mode {
-        BodyMode::None | BodyMode::Other(_) => kv_table(&[]),
-        BodyMode::Json => text_block(&body.json),
-        BodyMode::Text => text_block(&body.text),
-        BodyMode::Xml => text_block(&body.xml),
-        BodyMode::Sparql => text_block(&body.sparql),
-        BodyMode::Graphql => text_block(&body.graphql),
-        BodyMode::FormUrlEncoded => kv_table(&body.form_urlencoded),
-        BodyMode::MultipartForm => kv_table(&body.multipart_form),
-    };
-    section(body.mode.as_str(), content)
-}
-
-fn section(title: &str, content: AnyElement) -> AnyElement {
-    div()
-        .flex()
-        .flex_col()
-        .gap_1()
-        .child(
-            div()
-                .text_xs()
-                .text_color(c(theme::TEXT_FAINT))
-                .child(SharedString::from(title.to_owned())),
-        )
-        .child(content)
-        .into_any_element()
-}
-
-fn update_summary(folder: &mut Folder, path: &Path, method: HttpMethod) -> bool {
-    folder.children.iter_mut().any(|node| match node {
-        Node::Request(r) if r.path == path => {
-            r.method = method;
-            true
-        }
-        Node::Folder(f) => update_summary(f, path, method),
-        Node::Request(_) => false,
-    })
+        .cursor_pointer()
+        .text_sm()
+        .when(primary, |el| {
+            el.bg(c(theme::ACCENT))
+                .text_color(c(theme::SURFACE_ALT))
+                .hover(|s| s.opacity(0.85))
+        })
+        .when(!primary, |el| {
+            el.border_1()
+                .border_color(c(theme::HOVER))
+                .text_color(c(theme::TEXT))
+                .hover(|s| s.bg(c(theme::ELEVATED)))
+        })
+        .child(label)
 }

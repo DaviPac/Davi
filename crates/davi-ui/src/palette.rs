@@ -1,7 +1,7 @@
 //! `Cmd/Ctrl+P` quick-open palette.
 //!
-//! A self-contained entity: it owns its query, focus and selection, and talks
-//! to the workspace only through [`PaletteEvent`]s. Matching is a small
+//! A self-contained entity: it owns its query input, focus and selection, and
+//! talks to the workspace only through [`PaletteEvent`]s. Matching is a small
 //! allocation-free fuzzy scorer, fast enough to re-run on every keystroke for
 //! thousands of requests.
 
@@ -10,13 +10,30 @@ use std::sync::Arc;
 
 use davi_core::model::HttpMethod;
 use gpui::{
-    Context, EventEmitter, FocusHandle, Focusable, KeyDownEvent, MouseButton, SharedString, Window,
-    div, prelude::*, px,
+    App, Context, Entity, EventEmitter, FocusHandle, Focusable, KeyBinding, MouseButton,
+    SharedString, Subscription, Window, actions, div, prelude::*, px,
 };
+use gpui_component::input::{Input, InputEvent, InputState};
 
 use crate::theme::{self, c};
 
 const MAX_RESULTS: usize = 50;
+const CONTEXT: &str = "CommandPalette";
+
+actions!(palette, [SelectPrev, SelectNext, Confirm, Dismiss]);
+
+/// Bind the palette's navigation keys. They are scoped to the palette's text
+/// input, so they must be registered after `gpui_component::init` to take
+/// precedence over the input's own up/down/enter/escape bindings.
+pub fn init(cx: &mut App) {
+    let ctx = Some("CommandPalette > Input");
+    cx.bind_keys([
+        KeyBinding::new("up", SelectPrev, ctx),
+        KeyBinding::new("down", SelectNext, ctx),
+        KeyBinding::new("enter", Confirm, ctx),
+        KeyBinding::new("escape", Dismiss, ctx),
+    ]);
+}
 
 #[derive(Debug, Clone)]
 pub struct PaletteItem {
@@ -33,44 +50,51 @@ pub enum PaletteEvent {
 }
 
 pub struct CommandPalette {
-    focus_handle: FocusHandle,
+    input: Entity<InputState>,
     items: Arc<[PaletteItem]>,
-    query: String,
     matches: Vec<usize>,
     selected: usize,
+    _subscription: Subscription,
 }
 
 impl EventEmitter<PaletteEvent> for CommandPalette {}
 
 impl Focusable for CommandPalette {
-    fn focus_handle(&self, _: &gpui::App) -> FocusHandle {
-        self.focus_handle.clone()
+    fn focus_handle(&self, cx: &App) -> FocusHandle {
+        self.input.focus_handle(cx)
     }
 }
 
 impl CommandPalette {
-    pub fn new(items: Arc<[PaletteItem]>, cx: &mut Context<Self>) -> Self {
+    pub fn new(items: Arc<[PaletteItem]>, window: &mut Window, cx: &mut Context<Self>) -> Self {
+        let input = cx.new(|cx| InputState::new(window, cx).placeholder("Search requests…"));
+        let subscription = cx.subscribe_in(&input, window, |this, _, event, _, cx| {
+            if matches!(event, InputEvent::Change) {
+                this.update_matches(cx);
+            }
+        });
+        input.update(cx, |input, cx| input.focus(window, cx));
         let mut this = Self {
-            focus_handle: cx.focus_handle(),
+            input,
             items,
-            query: String::new(),
             matches: Vec::new(),
             selected: 0,
+            _subscription: subscription,
         };
-        this.update_matches();
+        this.update_matches(cx);
         this
     }
 
-    fn update_matches(&mut self) {
-        let query = self.query.trim();
+    fn update_matches(&mut self, cx: &mut Context<Self>) {
+        let query = self.input.read(cx).value().trim().to_owned();
         let mut scored: Vec<(i32, usize)> = self
             .items
             .iter()
             .enumerate()
             .filter_map(|(ix, item)| {
                 // Name matches outrank folder matches.
-                let by_name = fuzzy_score(query, &item.name).map(|s| s + 1000);
-                let by_location = fuzzy_score(query, &format!("{} {}", item.location, item.name));
+                let by_name = fuzzy_score(&query, &item.name).map(|s| s + 1000);
+                let by_location = fuzzy_score(&query, &format!("{} {}", item.location, item.name));
                 by_name.or(by_location).map(|score| (score, ix))
             })
             .collect();
@@ -81,55 +105,46 @@ impl CommandPalette {
             .map(|(_, ix)| ix)
             .collect();
         self.selected = 0;
+        cx.notify();
     }
 
-    fn confirm(&mut self, ix: usize, cx: &mut Context<Self>) {
+    fn confirm_at(&mut self, ix: usize, cx: &mut Context<Self>) {
         if let Some(item) = self.matches.get(ix).map(|&i| &self.items[i]) {
             cx.emit(PaletteEvent::Confirmed(item.path.clone()));
         }
     }
 
-    fn on_key_down(&mut self, event: &KeyDownEvent, _: &mut Window, cx: &mut Context<Self>) {
-        let ks = &event.keystroke;
-        match ks.key.as_str() {
-            "escape" => cx.emit(PaletteEvent::Dismissed),
-            "enter" => self.confirm(self.selected, cx),
-            "up" => self.selected = self.selected.saturating_sub(1),
-            "down" => self.selected = (self.selected + 1).min(self.matches.len().saturating_sub(1)),
-            "backspace" => {
-                self.query.pop();
-                self.update_matches();
-            }
-            _ => match &ks.key_char {
-                Some(ch) if !ks.modifiers.control && !ks.modifiers.platform => {
-                    self.query.push_str(ch);
-                    self.update_matches();
-                }
-                _ => return,
-            },
-        }
-        cx.stop_propagation();
+    fn select_prev(&mut self, _: &SelectPrev, _: &mut Window, cx: &mut Context<Self>) {
+        self.selected = self.selected.saturating_sub(1);
         cx.notify();
+    }
+
+    fn select_next(&mut self, _: &SelectNext, _: &mut Window, cx: &mut Context<Self>) {
+        self.selected = (self.selected + 1).min(self.matches.len().saturating_sub(1));
+        cx.notify();
+    }
+
+    fn confirm(&mut self, _: &Confirm, _: &mut Window, cx: &mut Context<Self>) {
+        self.confirm_at(self.selected, cx);
+    }
+
+    fn dismiss(&mut self, _: &Dismiss, _: &mut Window, cx: &mut Context<Self>) {
+        cx.emit(PaletteEvent::Dismissed);
     }
 }
 
 impl Render for CommandPalette {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let query_label: SharedString = if self.query.is_empty() {
-            "Search requests…".into()
-        } else {
-            self.query.clone().into()
-        };
-
         div()
             .id("command-palette")
-            .track_focus(&self.focus_handle)
-            .key_context("CommandPalette")
-            .on_key_down(cx.listener(Self::on_key_down))
+            .key_context(CONTEXT)
+            .on_action(cx.listener(Self::select_prev))
+            .on_action(cx.listener(Self::select_next))
+            .on_action(cx.listener(Self::confirm))
+            .on_action(cx.listener(Self::dismiss))
             // Keep clicks inside the palette from reaching the backdrop.
             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
             .w(px(560.))
-            .max_h(px(420.))
             .flex()
             .flex_col()
             .bg(c(theme::SURFACE))
@@ -140,20 +155,15 @@ impl Render for CommandPalette {
             .overflow_hidden()
             .child(
                 div()
-                    .px_3()
-                    .py_2()
+                    .p_2()
                     .border_b_1()
                     .border_color(c(theme::BORDER))
-                    .text_color(c(if self.query.is_empty() {
-                        theme::TEXT_FAINT
-                    } else {
-                        theme::TEXT
-                    }))
-                    .child(query_label),
+                    .child(Input::new(&self.input).appearance(false)),
             )
             .child(
                 div()
                     .id("palette-results")
+                    .max_h(px(360.))
                     .flex()
                     .flex_col()
                     .overflow_y_scroll()
@@ -171,7 +181,7 @@ impl Render for CommandPalette {
                             .cursor_pointer()
                             .when(selected, |el| el.bg(c(theme::ELEVATED)))
                             .hover(|s| s.bg(c(theme::ELEVATED)))
-                            .on_click(cx.listener(move |this, _, _, cx| this.confirm(row, cx)))
+                            .on_click(cx.listener(move |this, _, _, cx| this.confirm_at(row, cx)))
                             .child(
                                 div()
                                     .w(px(44.))
@@ -188,13 +198,13 @@ impl Render for CommandPalette {
                             )
                     }))
                     .when(self.matches.is_empty(), |el| {
-                        el.child(
-                            div()
-                                .px_3()
-                                .py_2()
-                                .text_color(c(theme::TEXT_FAINT))
-                                .child("No matching requests"),
-                        )
+                        el.child(div().px_3().py_2().text_color(c(theme::TEXT_FAINT)).child(
+                            if self.items.is_empty() {
+                                "This collection has no requests yet"
+                            } else {
+                                "No matching requests"
+                            },
+                        ))
                     }),
             )
     }
