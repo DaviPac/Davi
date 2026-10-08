@@ -1,0 +1,20 @@
+meta {
+  name: Get User
+  type: http
+  seq: 2
+}
+
+get {
+  url: {{baseUrl}}/anything/users/:id
+  body: none
+  auth: basic
+}
+
+params:path {
+  id: {{userId}}
+}
+
+auth:basic {
+  username: ada
+  password: s3cret
+}

@@ -1,0 +1,62 @@
+[workspace]
+resolver = "3"
+members = ["crates/davi-core", "crates/davi-net", "crates/davi-ui"]
+default-members = ["crates/davi-ui"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+license = "MIT"
+repository = "https://github.com/DaviPac/Davi"
+
+[workspace.dependencies]
+# Internal crates
+davi-core = { path = "crates/davi-core" }
+davi-net = { path = "crates/davi-net" }
+
+# UI
+gpui = "0.2.2"
+
+# Async / networking
+tokio = { version = "1.47", default-features = false, features = ["rt-multi-thread", "sync", "time", "fs"] }
+reqwest = { version = "0.13", default-features = false, features = [
+    "rustls",
+    "http2",
+    "cookies",
+    "gzip",
+    "brotli",
+    "zstd",
+    "deflate",
+    "stream",
+    "multipart",
+    "form",
+] }
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
+bytes = "1"
+
+# Parsing / data
+nom = "8"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Errors / diagnostics
+anyhow = "1"
+thiserror = "2"
+log = "0.4"
+env_logger = { version = "0.11", default-features = false, features = ["auto-color", "humantime"] }
+
+[profile.dev]
+# Keep our own crates fast to compile but optimise dependencies so the GPUI
+# renderer is usable in debug builds.
+opt-level = 0
+
+[profile.dev.package."*"]
+opt-level = 2
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+strip = "symbols"
+panic = "abort"

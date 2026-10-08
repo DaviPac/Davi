@@ -1,0 +1,20 @@
+[package]
+name = "davi-ui"
+description = "Davi desktop client: GPUI views, layout and application state"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "davi"
+path = "src/main.rs"
+
+[dependencies]
+davi-core.workspace = true
+davi-net.workspace = true
+gpui.workspace = true
+serde_json.workspace = true
+anyhow.workspace = true
+log.workspace = true
+env_logger.workspace = true
