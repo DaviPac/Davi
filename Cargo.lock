@@ -1463,7 +1463,6 @@ dependencies = [
  "anyhow",
  "davi-core",
  "davi-net",
- "embed-resource",
  "env_logger",
  "gpui",
  "log",

@@ -130,21 +130,14 @@ cargo clippy --workspace --all-targets
 
 ### Windows releases
 
-* **CI (preferred):** push a `v*` tag, or run the *Release (Windows)*
-  workflow manually. It builds natively with MSVC on `windows-latest`, so
-  shaders are precompiled, and attaches `davi.exe` plus a zip to a GitHub
-  Release.
-* **Cross-compiling from Linux** (MinGW, `apt install mingw-w64`):
+Push a `v*` tag (or run the *Release (Windows)* workflow manually). CI
+builds natively with MSVC on `windows-latest` and attaches `davi.exe` and a
+zip to a GitHub Release.
 
-  ```
-  rustup target add x86_64-pc-windows-gnu
-  CARGO_TARGET_X86_64_PC_WINDOWS_GNU_LINKER=x86_64-w64-mingw32-gcc-posix \
-    cargo build --profile release-windows-cross --target x86_64-pc-windows-gnu -p davi-ui
-  ```
-
-  This produces a single self-contained `davi.exe` (Windows 10 1903+). GPUI
-  compiles its shaders at first launch via the system `d3dcompiler_47.dll`
-  because `fxc.exe` only exists on Windows hosts.
+Windows builds must run on a Windows host. GPUI precompiles its HLSL
+shaders with `fxc.exe` from the Windows SDK, and a cross-compiled binary
+would look for shader sources on the build machine at runtime, failing with
+"Error creating DirectWriteTextSystem".
 
 ## Roadmap
 

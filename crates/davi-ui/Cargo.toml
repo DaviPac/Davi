@@ -18,6 +18,3 @@ serde_json.workspace = true
 anyhow.workspace = true
 log.workspace = true
 env_logger.workspace = true
-
-[build-dependencies]
-embed-resource = "3.0"
