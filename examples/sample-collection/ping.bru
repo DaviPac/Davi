@@ -1,0 +1,19 @@
+meta {
+  name: Ping
+  type: http
+  seq: 1
+}
+
+get {
+  url: {{baseUrl}}/get?source=davi
+  body: none
+  auth: none
+}
+
+params:query {
+  source: davi
+}
+
+headers {
+  Accept: application/json
+}

@@ -1,0 +1,21 @@
+[package]
+name = "davi-net"
+description = "Davi async HTTP execution engine (reqwest + tokio)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+davi-core.workspace = true
+tokio.workspace = true
+reqwest.workspace = true
+futures-util.workspace = true
+bytes.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+log.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true
+tokio = { workspace = true, features = ["macros", "net", "io-util"] }

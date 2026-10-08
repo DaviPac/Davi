@@ -1,0 +1,39 @@
+meta {
+  name: Create User
+  type: http
+  seq: 1
+}
+
+post {
+  url: {{baseUrl}}/post
+  body: json
+  auth: bearer
+}
+
+headers {
+  Content-Type: application/json
+  ~X-Debug: true
+}
+
+auth:bearer {
+  token: {{token}}
+}
+
+body:json {
+  {
+    "id": {{userId}},
+    "name": "Ada Lovelace"
+  }
+}
+
+vars:post-response {
+  createdId: res.body.json.id
+}
+
+assert {
+  res.status: eq 200
+}
+
+docs {
+  Creates a user and echoes it back.
+}
