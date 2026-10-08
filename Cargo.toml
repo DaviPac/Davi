@@ -60,3 +60,16 @@ lto = "fat"
 codegen-units = 1
 strip = "symbols"
 panic = "abort"
+
+# Cross-compiling Windows builds from Linux/macOS. GPUI precompiles its HLSL
+# shaders with fxc.exe only when the *host* is Windows; with debug assertions
+# on for gpui it compiles them at startup via d3dcompiler_47.dll (bundled
+# with Windows 10+) instead. Native Windows builds should use `release`.
+[profile.release-windows-cross]
+inherits = "release"
+
+[profile.release-windows-cross.package.gpui]
+debug-assertions = true
+
+[profile.release-windows-cross.package.gpui-macros]
+debug-assertions = true

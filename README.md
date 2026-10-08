@@ -128,6 +128,24 @@ cargo test --workspace
 cargo clippy --workspace --all-targets
 ```
 
+### Windows releases
+
+* **CI (preferred):** push a `v*` tag, or run the *Release (Windows)*
+  workflow manually. It builds natively with MSVC on `windows-latest`, so
+  shaders are precompiled, and attaches `davi.exe` plus a zip to a GitHub
+  Release.
+* **Cross-compiling from Linux** (MinGW, `apt install mingw-w64`):
+
+  ```
+  rustup target add x86_64-pc-windows-gnu
+  CARGO_TARGET_X86_64_PC_WINDOWS_GNU_LINKER=x86_64-w64-mingw32-gcc-posix \
+    cargo build --profile release-windows-cross --target x86_64-pc-windows-gnu -p davi-ui
+  ```
+
+  This produces a single self-contained `davi.exe` (Windows 10 1903+). GPUI
+  compiles its shaders at first launch via the system `d3dcompiler_47.dll`
+  because `fxc.exe` only exists on Windows hosts.
+
 ## Roadmap
 
 1. Text input / code editor component (URL bar, key-value tables, bodies),
