@@ -244,3 +244,140 @@ fn load_environments(dir: &Path, issues: &mut Vec<LoadIssue>) -> Vec<Environment
     envs.sort_by(|a, b| a.name.cmp(&b.name));
     envs
 }
+
+// ---------------------------------------------------------------------------
+// Scaffolding: creating collections, folders and requests on disk
+// ---------------------------------------------------------------------------
+
+/// Turn a display name into a portable file/folder name (Windows-safe).
+pub fn sanitize_file_name(name: &str) -> String {
+    let cleaned: String = name
+        .trim()
+        .chars()
+        .map(|c| match c {
+            '<' | '>' | ':' | '"' | '/' | '\\' | '|' | '?' | '*' => '-',
+            c if c.is_control() => '-',
+            c => c,
+        })
+        .collect();
+    let cleaned = cleaned.trim_end_matches(['.', ' ']).to_owned();
+    if cleaned.is_empty() {
+        "untitled".to_owned()
+    } else {
+        cleaned
+    }
+}
+
+/// `dir/stem.ext`, or `dir/stem-2.ext`, `dir/stem-3.ext`... if taken.
+fn unique_path(dir: &Path, stem: &str, extension: Option<&str>) -> PathBuf {
+    let make = |suffix: String| {
+        let name = match extension {
+            Some(ext) => format!("{stem}{suffix}.{ext}"),
+            None => format!("{stem}{suffix}"),
+        };
+        dir.join(name)
+    };
+    let mut candidate = make(String::new());
+    let mut n = 2;
+    while candidate.exists() {
+        candidate = make(format!("-{n}"));
+        n += 1;
+    }
+    candidate
+}
+
+/// Create `parent/<name>/` with a `bruno.json` manifest. Returns its path.
+pub fn create_collection(parent: &Path, name: &str) -> Result<PathBuf, CoreError> {
+    let dir = unique_path(parent, &sanitize_file_name(name), None);
+    std::fs::create_dir_all(&dir).map_err(|e| CoreError::io(&dir, e))?;
+    write_manifest(&dir, name)?;
+    Ok(dir)
+}
+
+/// Turn an existing folder into a collection by adding a `bruno.json`
+/// (named after the folder) if it doesn't have one yet.
+pub fn ensure_collection(dir: &Path) -> Result<(), CoreError> {
+    if dir.join(COLLECTION_MANIFEST).exists() {
+        return Ok(());
+    }
+    let name = dir
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "Collection".to_owned());
+    write_manifest(dir, &name)
+}
+
+fn write_manifest(dir: &Path, name: &str) -> Result<(), CoreError> {
+    let manifest = serde_json::json!({
+        "version": "1",
+        "name": name.trim(),
+        "type": "collection",
+        "ignore": ["node_modules", ".git"],
+    });
+    let path = dir.join(COLLECTION_MANIFEST);
+    let text = serde_json::to_string_pretty(&manifest).unwrap_or_default() + "\n";
+    std::fs::write(&path, text).map_err(|e| CoreError::io(&path, e))
+}
+
+/// Create `dir/<name>/folder.bru`. Returns the new folder's path.
+pub fn create_folder(dir: &Path, name: &str) -> Result<PathBuf, CoreError> {
+    let folder = unique_path(dir, &sanitize_file_name(name), None);
+    std::fs::create_dir_all(&folder).map_err(|e| CoreError::io(&folder, e))?;
+    let meta = bru::BruFile {
+        blocks: vec![bru::Block::dict(
+            "meta",
+            vec![
+                crate::model::KeyValue::new("name", name.trim()),
+                crate::model::KeyValue::new("seq", next_seq(dir).to_string()),
+            ],
+        )],
+    };
+    let path = folder.join(FOLDER_FILE);
+    std::fs::write(&path, bru::write(&meta)).map_err(|e| CoreError::io(&path, e))?;
+    Ok(folder)
+}
+
+/// Create a new GET request file in `dir`, sequenced after its siblings.
+pub fn create_request(dir: &Path, name: &str) -> Result<PathBuf, CoreError> {
+    let path = unique_path(dir, &sanitize_file_name(name), Some("bru"));
+    let mut request = HttpRequest::new(name.trim(), HttpMethod::Get, "");
+    request.meta.seq = Some(next_seq(dir));
+    std::fs::write(&path, bru::write_request(&request)).map_err(|e| CoreError::io(&path, e))?;
+    Ok(path)
+}
+
+/// One more than the highest `seq` among the requests and folders in `dir`.
+fn next_seq(dir: &Path) -> u32 {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return 1;
+    };
+    let seq_of = |path: &Path| -> Option<u32> {
+        let source = std::fs::read_to_string(path).ok()?;
+        let file = bru::parse(&source).ok()?;
+        let meta = file.dict("meta")?;
+        meta.iter()
+            .find(|e| e.name == "seq")?
+            .value
+            .trim()
+            .parse()
+            .ok()
+    };
+    entries
+        .flatten()
+        .filter_map(|e| {
+            let path = e.path();
+            if path.is_dir() {
+                seq_of(&path.join(FOLDER_FILE))
+            } else if path.extension().is_some_and(|x| x == "bru")
+                && path
+                    .file_name()
+                    .is_some_and(|n| n != COLLECTION_FILE && n != FOLDER_FILE)
+            {
+                seq_of(&path)
+            } else {
+                None
+            }
+        })
+        .max()
+        .map_or(1, |max| max + 1)
+}

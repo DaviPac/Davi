@@ -6,16 +6,31 @@ are plain-text Bruno `.bru` files on disk, so they version cleanly in Git and
 stay compatible with [Bruno](https://www.usebruno.com/).
 
 ```
-cargo run --release -- examples/sample-collection   # or DAVI_COLLECTION=<dir>
+cargo run --release                       # welcome screen / last collection
+cargo run --release -- path/to/collection # open a specific collection
 ```
 
-| Shortcut (⌘ on macOS)  | Action                                  |
-| ---------------------- | --------------------------------------- |
+On first launch, create a collection or open any folder (a `bruno.json` is
+added if it is missing). Davi reopens the last collection on the next start.
+
+| Shortcut (⌘ on macOS)  | Action                                   |
+| ---------------------- | ---------------------------------------- |
 | `Ctrl+P`               | Quick-open request (fuzzy search)        |
-| `Ctrl+Enter`           | Send / cancel the active request         |
+| `Ctrl+N`               | New request (in the selected folder)     |
+| `Ctrl+Shift+N`         | New folder                               |
+| `Ctrl+O`               | Open collection                          |
+| `Ctrl+Shift+O`         | New collection                           |
+| `Ctrl+Enter` / `Enter` in URL | Send / cancel the active request  |
 | `Ctrl+S`               | Save the active request to its `.bru`    |
-| `Ctrl+W`               | Close tab                                |
+| `Ctrl+W`               | Close tab (asks before discarding edits) |
 | `Ctrl+E`               | Cycle environment                        |
+
+The request editor covers method, URL (kept in sync with the query-param
+table), path params, headers, auth (Bearer, Basic, API key, inherit), body
+(JSON/Text/XML code editor, form URL-encoded, multipart with `@file(...)`)
+and pre/post-response vars. Text inputs come from
+[`gpui-component`](https://github.com/longbridge/gpui-component) 0.5.1, the
+last release built on `gpui 0.2.2`.
 
 ## Workspace architecture
 
@@ -130,21 +145,14 @@ cargo clippy --workspace --all-targets
 
 ### Windows releases
 
-* **CI (preferred):** push a `v*` tag, or run the *Release (Windows)*
-  workflow manually. It builds natively with MSVC on `windows-latest`, so
-  shaders are precompiled, and attaches `davi.exe` plus a zip to a GitHub
-  Release.
-* **Cross-compiling from Linux** (MinGW, `apt install mingw-w64`):
+Push a `v*` tag (or run the *Release (Windows)* workflow manually). CI
+builds natively with MSVC on `windows-latest` and attaches `davi.exe` and a
+zip to a GitHub Release.
 
-  ```
-  rustup target add x86_64-pc-windows-gnu
-  CARGO_TARGET_X86_64_PC_WINDOWS_GNU_LINKER=x86_64-w64-mingw32-gcc-posix \
-    cargo build --profile release-windows-cross --target x86_64-pc-windows-gnu -p davi-ui
-  ```
-
-  This produces a single self-contained `davi.exe` (Windows 10 1903+). GPUI
-  compiles its shaders at first launch via the system `d3dcompiler_47.dll`
-  because `fxc.exe` only exists on Windows hosts.
+Windows builds must run on a Windows host. GPUI precompiles its HLSL
+shaders with `fxc.exe` from the Windows SDK, and a cross-compiled binary
+would look for shader sources on the build machine at runtime, failing with
+"Error creating DirectWriteTextSystem".
 
 ## Roadmap
 

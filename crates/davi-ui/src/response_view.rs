@@ -1,25 +1,16 @@
 //! Render-ready snapshot of an [`HttpResponse`].
 //!
-//! Built once per response on a background thread: pretty-printing,
-//! line-splitting and highlighting never happen inside `render`, which only
-//! slices the visible lines out of a virtualized list.
-
-use std::ops::Range;
-use std::sync::Arc;
+//! Built once per response on a background thread: pretty-printing and
+//! choosing a highlight language never happen on the UI thread. The text is
+//! then shown in a read-only code editor (selectable, copyable, searchable,
+//! horizontally scrollable).
 
 use davi_net::HttpResponse;
-use gpui::{HighlightStyle, SharedString};
+use gpui::SharedString;
 
-use crate::highlight::highlight_json_line;
-
-/// Extremely long lines (minified HTML, base64...) are clipped for layout;
-/// the full body stays available for copy/save.
-const MAX_LINE_CHARS: usize = 4_000;
-
-pub struct BodyLine {
-    pub text: SharedString,
-    pub highlights: Arc<[(Range<usize>, HighlightStyle)]>,
-}
+/// Above this size, syntax highlighting is skipped to keep huge responses
+/// responsive.
+const MAX_HIGHLIGHT_BYTES: usize = 2 * 1024 * 1024;
 
 pub struct ResponseView {
     pub status: u16,
@@ -27,28 +18,29 @@ pub struct ResponseView {
     pub time: SharedString,
     pub size: SharedString,
     pub headers: Vec<(SharedString, SharedString)>,
-    pub lines: Arc<[BodyLine]>,
+    /// Pretty-printed body (JSON) or the raw body as text.
+    pub body: String,
+    /// `gpui-component` highlighter language for `body`.
+    pub language: &'static str,
     pub truncated: bool,
 }
 
 impl ResponseView {
     pub fn build(response: HttpResponse) -> Self {
-        let pretty = response.pretty_body();
-        let is_json = response.is_json() || pretty.starts_with(['{', '[']);
-        let lines: Arc<[BodyLine]> = pretty
-            .lines()
-            .map(|line| {
-                let line = clip(line);
-                BodyLine {
-                    highlights: if is_json {
-                        highlight_json_line(line).into()
-                    } else {
-                        Arc::from([])
-                    },
-                    text: SharedString::from(line.to_owned()),
-                }
-            })
-            .collect();
+        let body = response.pretty_body();
+        let content_type = response
+            .content_type()
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        let language = if body.len() > MAX_HIGHLIGHT_BYTES {
+            "text"
+        } else if response.is_json() || body.starts_with(['{', '[']) {
+            "json"
+        } else if content_type.contains("html") || content_type.contains("xml") {
+            "html"
+        } else {
+            "text"
+        };
 
         Self {
             status: response.status,
@@ -67,16 +59,19 @@ impl ResponseView {
                 .into_iter()
                 .map(|(k, v)| (k.into(), v.into()))
                 .collect(),
-            lines,
+            body,
+            language,
             truncated: response.truncated,
         }
     }
-}
 
-fn clip(line: &str) -> &str {
-    match line.char_indices().nth(MAX_LINE_CHARS) {
-        Some((ix, _)) => &line[..ix],
-        None => line,
+    /// Headers as `Name: value` lines, for the read-only headers view.
+    pub fn headers_text(&self) -> String {
+        self.headers
+            .iter()
+            .map(|(k, v)| format!("{k}: {v}"))
+            .collect::<Vec<_>>()
+            .join("\n")
     }
 }
 
