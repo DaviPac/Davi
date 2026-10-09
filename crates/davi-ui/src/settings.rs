@@ -1,4 +1,4 @@
-//! Small persisted app settings (recent collections), stored as JSON in the
+//! Small persisted app settings (recent collections, layout), stored as JSON in the
 //! platform config directory.
 
 use std::path::PathBuf;
@@ -11,6 +11,9 @@ const MAX_RECENT: usize = 10;
 pub struct Settings {
     #[serde(default)]
     pub recent_collections: Vec<PathBuf>,
+    /// Last width the user dragged the sidebar to, in pixels.
+    #[serde(default)]
+    pub sidebar_width: Option<f32>,
 }
 
 impl Settings {

@@ -20,6 +20,7 @@ use gpui::{
     Window, deferred, div, prelude::*, px,
 };
 use gpui_component::input::{Input, InputEvent, InputState};
+use gpui_component::resizable::{ResizableState, h_resizable, resizable_panel};
 use gpui_component::{Sizable, WindowExt};
 
 use crate::kv_editor::{KvEditor, KvEvent};
@@ -138,6 +139,8 @@ pub struct RequestEditor {
     response_headers: Entity<InputState>,
     response_error: Entity<InputState>,
     method_menu_open: bool,
+    /// Request | response split, owned by the workspace and shared by all tabs.
+    split: Entity<ResizableState>,
     next_request_id: u64,
     _subscriptions: Vec<Subscription>,
 }
@@ -148,6 +151,7 @@ impl RequestEditor {
     pub fn new(
         path: PathBuf,
         request: HttpRequest,
+        split: Entity<ResizableState>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -322,6 +326,7 @@ impl RequestEditor {
             response_error,
             response: ResponseState::Idle,
             method_menu_open: false,
+            split,
             next_request_id: 0,
             _subscriptions: subscriptions,
         }
@@ -1041,33 +1046,35 @@ impl RequestEditor {
 
 impl Render for RequestEditor {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        div()
-            .size_full()
-            .flex()
+        // Without an initial size both panes start at half the width.
+        h_resizable("request-response-split")
+            .with_state(&self.split)
             .child(
-                div()
-                    .flex_1()
-                    .flex_basis(px(0.))
-                    .min_w_0()
-                    .overflow_hidden()
-                    .h_full()
-                    .flex()
-                    .flex_col()
-                    .border_r_1()
-                    .border_color(c(theme::BORDER))
-                    .child(self.render_url_bar(cx))
-                    .child(self.render_editor_tabs(cx))
-                    .child(
-                        div()
-                            .id("request-content")
-                            .flex_1()
-                            .min_h_0()
-                            .overflow_y_scroll()
-                            .p_3()
-                            .child(self.render_editor_content(cx)),
-                    ),
+                resizable_panel().size_range(px(240.)..px(f32::MAX)).child(
+                    div()
+                        .size_full()
+                        .min_w_0()
+                        .overflow_hidden()
+                        .flex()
+                        .flex_col()
+                        .child(self.render_url_bar(cx))
+                        .child(self.render_editor_tabs(cx))
+                        .child(
+                            div()
+                                .id("request-content")
+                                .flex_1()
+                                .min_h_0()
+                                .overflow_y_scroll()
+                                .p_3()
+                                .child(self.render_editor_content(cx)),
+                        ),
+                ),
             )
-            .child(self.render_response(cx))
+            .child(
+                resizable_panel()
+                    .size_range(px(200.)..px(f32::MAX))
+                    .child(self.render_response(cx)),
+            )
     }
 }
 
