@@ -5,8 +5,8 @@ use std::path::PathBuf;
 use anyhow::Context as _;
 use davi_net::{EngineConfig, HttpEngine};
 use davi_ui::workspace::{
-    CloseTab, NewCollection, NewFolder, NewRequest, NextEnvironment, OpenCollection, Quit,
-    SaveRequest, SendRequest, ToggleCommandPalette, Workspace,
+    CloseTab, ManageEnvironments, NewCollection, NewFolder, NewRequest, NextEnvironment,
+    OpenCollection, Quit, SaveRequest, SendRequest, ToggleCommandPalette, Workspace,
 };
 use gpui::{
     App, Application, Bounds, KeyBinding, TitlebarOptions, WindowBounds, WindowOptions, prelude::*,
@@ -41,6 +41,7 @@ fn main() -> anyhow::Result<()> {
             KeyBinding::new("secondary-s", SaveRequest, None),
             KeyBinding::new("secondary-w", CloseTab, None),
             KeyBinding::new("secondary-e", NextEnvironment, None),
+            KeyBinding::new("secondary-shift-e", ManageEnvironments, None),
             KeyBinding::new("secondary-n", NewRequest, None),
             KeyBinding::new("secondary-shift-n", NewFolder, None),
             KeyBinding::new("secondary-o", OpenCollection, None),

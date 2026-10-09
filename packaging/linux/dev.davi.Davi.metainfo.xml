@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>dev.davi.Davi</id>
+  <name>Davi</name>
+  <summary>Fast, Git-friendly API client</summary>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>MIT</project_license>
+  <description>
+    <p>
+      Davi is a lightweight API client built with GPUI. Collections are
+      folders of plain-text Bruno .bru files, so they version cleanly in Git
+      and stay compatible with Bruno.
+    </p>
+  </description>
+  <launchable type="desktop-id">dev.davi.Davi.desktop</launchable>
+  <url type="homepage">https://github.com/DaviPac/Davi</url>
+  <provides>
+    <binary>davi</binary>
+  </provides>
+  <content_rating type="oars-1.1"/>
+</component>

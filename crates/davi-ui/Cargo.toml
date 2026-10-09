@@ -1,10 +1,29 @@
 [package]
 name = "davi-ui"
-description = "Davi desktop client: GPUI views, layout and application state"
+description = "Fast, Git-friendly API client (Davi desktop app)"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
+
+# `cargo deb -p davi-ui` builds the Linux .deb (see .github/workflows/release.yml).
+[package.metadata.deb]
+name = "davi"
+maintainer = "DaviPac <davipiresaquino@gmail.com>"
+copyright = "DaviPac"
+extended-description = "A lightweight, fast API client built with GPUI. Collections are plain-text Bruno .bru files that version cleanly in Git."
+section = "devel"
+priority = "optional"
+# `$auto` covers linked libraries; Vulkan and the X11/Wayland pieces are
+# loaded at runtime, so dpkg-shlibdeps can't see them.
+depends = "$auto, libvulkan1, libwayland-client0, libfontconfig1"
+recommends = "mesa-vulkan-drivers | vulkan-icd, xdg-desktop-portal"
+assets = [
+    ["target/release/davi", "usr/bin/", "755"],
+    ["../../packaging/linux/dev.davi.Davi.desktop", "usr/share/applications/", "644"],
+    ["../../packaging/linux/dev.davi.Davi.metainfo.xml", "usr/share/metainfo/", "644"],
+    ["../../assets/icon.png", "usr/share/icons/hicolor/512x512/apps/dev.davi.Davi.png", "644"],
+]
 
 [[bin]]
 name = "davi"

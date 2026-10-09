@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=Davi
+GenericName=API Client
+Comment=Fast, Git-friendly API client for Bruno collections
+Exec=davi
+Icon=dev.davi.Davi
+Terminal=false
+Categories=Development;WebDevelopment;
+Keywords=api;http;rest;bruno;request;
+StartupWMClass=dev.davi.Davi

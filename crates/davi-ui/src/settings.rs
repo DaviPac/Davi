@@ -53,6 +53,11 @@ impl Settings {
 }
 
 fn settings_path() -> Option<PathBuf> {
+    Some(config_dir()?.join("settings.json"))
+}
+
+/// Davi's per-user config directory (not created here).
+pub(crate) fn config_dir() -> Option<PathBuf> {
     let env = |k: &str| {
         std::env::var_os(k)
             .filter(|v| !v.is_empty())
@@ -67,5 +72,5 @@ fn settings_path() -> Option<PathBuf> {
             .or_else(|| env("HOME").map(|h| h.join(".config")))?
             .join("davi")
     };
-    Some(dir.join("settings.json"))
+    Some(dir)
 }
