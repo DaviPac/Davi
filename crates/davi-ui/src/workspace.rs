@@ -17,6 +17,9 @@ use gpui::{
 };
 use gpui_component::dialog::DialogButtonProps;
 use gpui_component::input::{Input, InputState};
+use gpui_component::resizable::{
+    ResizablePanelEvent, ResizableState, h_resizable, resizable_panel,
+};
 use gpui_component::{Root, WindowExt};
 
 use crate::palette::{CommandPalette, PaletteEvent, PaletteItem};
@@ -41,6 +44,8 @@ actions!(
 );
 
 const SIDEBAR_WIDTH: f32 = 270.;
+const SIDEBAR_MIN_WIDTH: f32 = 180.;
+const SIDEBAR_MAX_WIDTH: f32 = 600.;
 
 enum SidebarRow {
     Folder {
@@ -73,6 +78,12 @@ pub struct Workspace {
     environment: Option<usize>,
     palette: Option<(Entity<CommandPalette>, Subscription)>,
     notice: Option<(SharedString, bool)>,
+    /// Sidebar | main split.
+    sidebar_split: Entity<ResizableState>,
+    /// Request | response split, shared by every tab so it stays put when
+    /// switching between them.
+    editor_split: Entity<ResizableState>,
+    _sidebar_split_subscription: Subscription,
     _tab_subscriptions: Vec<(gpui::EntityId, Subscription)>,
 }
 
@@ -93,6 +104,19 @@ impl Workspace {
         window.focus(&focus_handle);
         let settings = Settings::load();
         let initial = collection_dir.or_else(|| settings.last_collection());
+        let sidebar_split = cx.new(|_| ResizableState::default());
+        let editor_split = cx.new(|_| ResizableState::default());
+        let sidebar_split_subscription = cx.subscribe(
+            &sidebar_split,
+            |this, split, _: &ResizablePanelEvent, cx| {
+                let Some(width) = split.read(cx).sizes().first() else {
+                    return;
+                };
+                let width = f32::from(*width).clamp(SIDEBAR_MIN_WIDTH, SIDEBAR_MAX_WIDTH);
+                this.settings.sidebar_width = Some(width);
+                this.settings.save();
+            },
+        );
 
         let mut this = Self {
             focus_handle,
@@ -107,6 +131,9 @@ impl Workspace {
             environment: None,
             palette: None,
             notice: None,
+            sidebar_split,
+            editor_split,
+            _sidebar_split_subscription: sidebar_split_subscription,
             _tab_subscriptions: Vec::new(),
         };
         if let Some(dir) = initial {
@@ -390,7 +417,9 @@ impl Workspace {
         }
         match collection::load_request(&path) {
             Ok(request) => {
-                let editor = cx.new(|cx| RequestEditor::new(path, request, window, cx));
+                let editor = cx.new(|cx| {
+                    RequestEditor::new(path, request, self.editor_split.clone(), window, cx)
+                });
                 let subscription = cx.subscribe_in(
                     &editor,
                     window,
@@ -710,14 +739,10 @@ impl Workspace {
         };
 
         div()
-            .w(px(SIDEBAR_WIDTH))
-            .h_full()
+            .size_full()
             .flex()
             .flex_col()
-            .flex_none()
             .bg(c(theme::SURFACE))
-            .border_r_1()
-            .border_color(c(theme::BORDER))
             .child(
                 div()
                     .flex()
@@ -1033,19 +1058,25 @@ impl Render for Workspace {
                     )
                     .into_any_element(),
             };
-            div()
-                .flex_1()
-                .min_h_0()
-                .flex()
-                .child(self.render_sidebar(cx))
+            let sidebar_width = self.settings.sidebar_width.unwrap_or(SIDEBAR_WIDTH);
+            h_resizable("sidebar-split")
+                .with_state(&self.sidebar_split)
                 .child(
-                    div()
-                        .flex_1()
-                        .min_w_0()
-                        .flex()
-                        .flex_col()
-                        .child(self.render_tab_bar(cx))
-                        .child(main),
+                    resizable_panel()
+                        .size(px(sidebar_width))
+                        .size_range(px(SIDEBAR_MIN_WIDTH)..px(SIDEBAR_MAX_WIDTH))
+                        .child(self.render_sidebar(cx)),
+                )
+                .child(
+                    resizable_panel().child(
+                        div()
+                            .size_full()
+                            .min_w_0()
+                            .flex()
+                            .flex_col()
+                            .child(self.render_tab_bar(cx))
+                            .child(main),
+                    ),
                 )
                 .into_any_element()
         };
