@@ -22,8 +22,11 @@ use gpui_component::resizable::{
 };
 use gpui_component::{Root, WindowExt};
 
+use crate::env_editor::{EnvironmentManager, folder_vars_hint};
+use crate::kv_editor::KvEditor;
 use crate::palette::{CommandPalette, PaletteEvent, PaletteItem};
 use crate::request_editor::{EditorEvent, RequestEditor, shortcut};
+use crate::secrets::SecretStore;
 use crate::settings::Settings;
 use crate::theme::{self, c};
 
@@ -35,6 +38,7 @@ actions!(
         SaveRequest,
         CloseTab,
         NextEnvironment,
+        ManageEnvironments,
         NewRequest,
         NewFolder,
         OpenCollection,
@@ -53,6 +57,7 @@ enum SidebarRow {
         name: SharedString,
         depth: usize,
         collapsed: bool,
+        has_vars: bool,
     },
     Request {
         path: PathBuf,
@@ -68,6 +73,7 @@ pub struct Workspace {
     focus_handle: FocusHandle,
     engine: HttpEngine,
     settings: Settings,
+    secrets: SecretStore,
     collection: Option<Collection>,
     collapsed: HashSet<PathBuf>,
     /// Folder new requests/folders are created in (`None` = collection root).
@@ -122,6 +128,7 @@ impl Workspace {
             focus_handle,
             engine,
             settings,
+            secrets: SecretStore::load(),
             collection: None,
             collapsed: HashSet::new(),
             selected_folder: None,
@@ -315,6 +322,124 @@ impl Workspace {
         );
     }
 
+    /// The environment manager dialog: create, rename, duplicate, delete
+    /// environments and edit their variables. Nothing is written until Save.
+    fn manage_environments(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(c) = &self.collection else {
+            return;
+        };
+        let root = c.root.path.clone();
+        let environments = c
+            .environments
+            .iter()
+            .map(|env| {
+                let mut env = env.clone();
+                self.secrets.fill(&root, &mut env);
+                env
+            })
+            .collect();
+        let selected = self.environment;
+        let manager =
+            cx.new(|cx| EnvironmentManager::new(root, environments, selected, window, cx));
+
+        let weak = cx.entity().downgrade();
+        window.open_dialog(cx, move |dialog, _, _| {
+            let (manager, weak) = (manager.clone(), weak.clone());
+            dialog
+                .title("Environments")
+                .w(px(720.))
+                .child(manager.clone())
+                .confirm()
+                .button_props(DialogButtonProps::default().ok_text("Save"))
+                .on_ok(move |_, _, cx| {
+                    weak.update(cx, |this, cx| {
+                        let applied = manager.update(cx, |m, cx| m.apply(&mut this.secrets, cx));
+                        let Ok(selected) = applied else {
+                            return false;
+                        };
+                        if let Err(e) = this.secrets.save() {
+                            log::warn!("failed to save secret values: {e}");
+                        }
+                        this.reload_collection(cx);
+                        this.environment = selected.and_then(|name| {
+                            let c = this.collection.as_ref()?;
+                            c.environments.iter().position(|e| e.name == name)
+                        });
+                        this.notice = Some(("Environments saved".into(), false));
+                        cx.notify();
+                        true
+                    })
+                    .unwrap_or(true)
+                })
+        });
+    }
+
+    /// Edit the variables of the folder `dir` (or of the collection, for its
+    /// root), which apply to every request beneath it.
+    fn edit_folder_vars(&mut self, dir: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(current) = &self.collection else {
+            return;
+        };
+        let Some(folder) = current.folder(&dir) else {
+            return;
+        };
+        let root = current.root.path.clone();
+        let is_root = dir == root;
+        let title: SharedString = if is_root {
+            format!("Collection Variables — {}", current.name).into()
+        } else {
+            format!("Folder Variables — {}", folder.name).into()
+        };
+        let vars = folder.vars.clone();
+        let editor = cx.new(|cx| KvEditor::new(&vars, "variable", "value", window, cx));
+
+        let weak = cx.entity().downgrade();
+        window.open_dialog(cx, move |dialog, _, _| {
+            let (editor, weak, root, dir) =
+                (editor.clone(), weak.clone(), root.clone(), dir.clone());
+            dialog
+                .title(title.clone())
+                .w(px(620.))
+                .child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap_3()
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(c(theme::TEXT_MUTED))
+                                .child(folder_vars_hint(is_root)),
+                        )
+                        .child(editor.clone()),
+                )
+                .confirm()
+                .button_props(DialogButtonProps::default().ok_text("Save"))
+                .on_ok(move |_, _, cx| {
+                    let vars: Vec<_> = editor
+                        .read(cx)
+                        .entries(cx)
+                        .into_iter()
+                        .filter(|kv| !kv.name.is_empty())
+                        .collect();
+                    weak.update(cx, |this, cx| {
+                        match collection::save_folder_vars(&root, &dir, &vars) {
+                            Ok(()) => {
+                                this.notice = Some(("Variables saved".into(), false));
+                                this.reload_collection(cx);
+                            }
+                            Err(e) => {
+                                this.notice = Some((e.to_string().into(), true));
+                                cx.notify();
+                            }
+                        }
+                    })
+                    .ok();
+                    true
+                })
+        });
+    }
+
     /// A small dialog asking for a name. Enter or the OK button confirms.
     fn prompt_name(
         &mut self,
@@ -371,6 +496,7 @@ impl Workspace {
                             name: f.name.clone().into(),
                             depth,
                             collapsed: is_collapsed,
+                            has_vars: !f.vars.is_empty(),
                         });
                         if !is_collapsed {
                             flatten(&f.children, depth + 1, collapsed, out);
@@ -485,15 +611,21 @@ impl Workspace {
         cx.notify();
     }
 
-    fn var_scope(&self) -> VarScope {
-        let mut scope = VarScope::new();
-        if let Some(env) = self
+    /// Variables for the request at `path`: its folders, the selected
+    /// environment (with secret values) and the collection.
+    fn var_scope(&self, path: &Path) -> VarScope {
+        let Some(c) = &self.collection else {
+            return VarScope::new();
+        };
+        let env = self
             .environment
-            .and_then(|ix| self.collection.as_ref()?.environments.get(ix))
-        {
-            scope.push_layer(env.enabled_vars());
-        }
-        scope
+            .and_then(|ix| c.environments.get(ix))
+            .map(|env| {
+                let mut env = env.clone();
+                self.secrets.fill(&c.root.path, &mut env);
+                env
+            });
+        c.var_scope(path, env.as_ref())
     }
 
     fn environment_name(&self) -> SharedString {
@@ -503,7 +635,7 @@ impl Workspace {
     }
 
     fn send(&mut self, editor: Entity<RequestEditor>, window: &mut Window, cx: &mut Context<Self>) {
-        let scope = self.var_scope();
+        let scope = self.var_scope(editor.read(cx).path());
         let engine = self.engine.clone();
         editor.update(cx, |editor, cx| editor.send(&engine, scope, window, cx));
     }
@@ -536,8 +668,18 @@ impl Workspace {
         }
     }
 
-    fn on_next_environment(&mut self, _: &NextEnvironment, _: &mut Window, cx: &mut Context<Self>) {
+    fn on_next_environment(
+        &mut self,
+        _: &NextEnvironment,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let count = self.collection.as_ref().map_or(0, |c| c.environments.len());
+        if count == 0 {
+            // Nothing to cycle through: offer to create one instead.
+            self.manage_environments(window, cx);
+            return;
+        }
         // Cycles through every environment and then "No Environment".
         self.environment = match self.environment {
             None if count > 0 => Some(0),
@@ -545,6 +687,15 @@ impl Workspace {
             _ => None,
         };
         cx.notify();
+    }
+
+    fn on_manage_environments(
+        &mut self,
+        _: &ManageEnvironments,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.manage_environments(window, cx);
     }
 
     fn on_new_request(&mut self, _: &NewRequest, window: &mut Window, cx: &mut Context<Self>) {
@@ -784,6 +935,16 @@ impl Workspace {
                         ),
                     )
                     .child(
+                        header_button("collection-vars", "{ }", "Collection variables").on_click(
+                            cx.listener(|this, _, window, cx| {
+                                if let Some(c) = &this.collection {
+                                    let root = c.root.path.clone();
+                                    this.edit_folder_vars(root, window, cx);
+                                }
+                            }),
+                        ),
+                    )
+                    .child(
                         header_button("switch-collection", "⇄", "Open another collection (Ctrl+O)")
                             .on_click(
                                 cx.listener(|this, _, window, cx| this.pick_collection(window, cx)),
@@ -839,9 +1000,10 @@ impl Workspace {
                 name,
                 depth,
                 collapsed,
+                has_vars,
             } => {
                 let is_selected = self.selected_folder.as_deref() == Some(path.as_path());
-                let (toggle_path, add_path) = (path.clone(), path.clone());
+                let (toggle_path, add_path, vars_path) = (path.clone(), path.clone(), path.clone());
                 row.pl(px(12. + *depth as f32 * 14.))
                     .when(is_selected, |el| el.bg(c(theme::ELEVATED)))
                     .text_color(c(theme::TEXT))
@@ -855,6 +1017,29 @@ impl Workspace {
                             .child(if *collapsed { "▸" } else { "▾" }),
                     )
                     .child(div().flex_1().min_w_0().truncate().child(name.clone()))
+                    .child(
+                        div()
+                            .id(("folder-vars", ix))
+                            .px_1()
+                            .rounded_sm()
+                            .text_xs()
+                            .when(*has_vars, |el| el.text_color(c(theme::ACCENT)))
+                            .when(!*has_vars, |el| {
+                                el.invisible()
+                                    .group_hover("sidebar-row", |s| s.visible())
+                                    .text_color(c(theme::TEXT_MUTED))
+                            })
+                            .hover(|s| s.bg(c(theme::HOVER)))
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                cx.stop_propagation();
+                                this.edit_folder_vars(vars_path.clone(), window, cx);
+                            }))
+                            .tooltip(|window, cx| {
+                                gpui_component::tooltip::Tooltip::new("Folder variables")
+                                    .build(window, cx)
+                            })
+                            .child("{ }"),
+                    )
                     .child(
                         div()
                             .id(("folder-add", ix))
@@ -997,8 +1182,35 @@ impl Workspace {
                             .on_click(cx.listener(|this, _, window, cx| {
                                 this.on_next_environment(&NextEnvironment, window, cx)
                             }))
+                            .tooltip(|window, cx| {
+                                gpui_component::tooltip::Tooltip::new(format!(
+                                    "Switch environment ({})",
+                                    shortcut("E")
+                                ))
+                                .build(window, cx)
+                            })
                             .child(format!("Env: {}", self.environment_name())),
                     )
+                    .when(self.collection.is_some(), |el| {
+                        el.child(
+                            div()
+                                .id("manage-env")
+                                .cursor_pointer()
+                                .text_color(c(theme::ACCENT))
+                                .hover(|s| s.opacity(0.8))
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.manage_environments(window, cx)
+                                }))
+                                .tooltip(|window, cx| {
+                                    gpui_component::tooltip::Tooltip::new(format!(
+                                        "Manage environments ({})",
+                                        shortcut("Shift+E")
+                                    ))
+                                    .build(window, cx)
+                                })
+                                .child("Edit…"),
+                        )
+                    })
                     .when_some(self.notice.clone(), |el, (msg, is_error)| {
                         el.child(
                             div()
@@ -1089,6 +1301,7 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::on_save))
             .on_action(cx.listener(Self::on_close_tab))
             .on_action(cx.listener(Self::on_next_environment))
+            .on_action(cx.listener(Self::on_manage_environments))
             .on_action(cx.listener(Self::on_new_request))
             .on_action(cx.listener(Self::on_new_folder))
             .on_action(cx.listener(Self::on_open_collection))

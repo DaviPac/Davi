@@ -26,6 +26,8 @@ pub struct KvEditor {
     next_id: usize,
     name_placeholder: SharedString,
     value_placeholder: SharedString,
+    /// Hide values as `•••` (secrets).
+    masked: bool,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -44,6 +46,7 @@ impl KvEditor {
             next_id: 0,
             name_placeholder: name_placeholder.into(),
             value_placeholder: value_placeholder.into(),
+            masked: false,
             _subscriptions: Vec::new(),
         };
         this.set_entries(entries, window, cx);
@@ -63,6 +66,15 @@ impl KvEditor {
             self.push_row(kv, window, cx);
         }
         cx.notify();
+    }
+
+    /// Mask every value input, now and for rows added later.
+    pub fn mask_values(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.masked = true;
+        for row in &self.rows {
+            row.value
+                .update(cx, |input, cx| input.set_masked(true, window, cx));
+        }
     }
 
     /// Current rows, skipping rows whose name and value are both empty.
@@ -91,9 +103,11 @@ impl KvEditor {
                 .placeholder(name_ph)
                 .default_value(kv.name.clone())
         });
+        let masked = self.masked;
         let value = cx.new(|cx| {
             InputState::new(window, cx)
                 .placeholder(value_ph)
+                .masked(masked)
                 .default_value(kv.value.clone())
         });
         for input in [&name, &value] {

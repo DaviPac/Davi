@@ -9,15 +9,18 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use crate::bru;
-use crate::env::Environment;
+use crate::bru::{self, Block, BruFile};
+use crate::env::{Environment, VarScope};
 use crate::error::CoreError;
-use crate::model::{HttpMethod, HttpRequest};
+use crate::model::{HttpMethod, HttpRequest, KeyValue};
 
 pub const COLLECTION_MANIFEST: &str = "bruno.json";
 pub const COLLECTION_FILE: &str = "collection.bru";
 pub const FOLDER_FILE: &str = "folder.bru";
 pub const ENVIRONMENTS_DIR: &str = "environments";
+/// Block of `folder.bru` / `collection.bru` holding the variables that every
+/// request beneath that folder (or the whole collection) can use.
+pub const FOLDER_VARS_BLOCK: &str = "vars:pre-request";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RequestSummary {
@@ -32,6 +35,9 @@ pub struct Folder {
     pub name: String,
     pub seq: Option<u32>,
     pub path: PathBuf,
+    /// `vars:pre-request` of this folder's `folder.bru` (or of
+    /// `collection.bru` for the root).
+    pub vars: Vec<KeyValue>,
     pub children: Vec<Node>,
 }
 
@@ -113,6 +119,65 @@ impl Collection {
     pub fn environment(&self, name: &str) -> Option<&Environment> {
         self.environments.iter().find(|e| e.name == name)
     }
+
+    /// The folder at `path`, if it is part of the tree (the root included).
+    pub fn folder(&self, path: &Path) -> Option<&Folder> {
+        self.folder_chain(path)
+            .last()
+            .copied()
+            .filter(|f| f.path == path)
+    }
+
+    /// The root followed by every folder down to the one containing `path`.
+    fn folder_chain(&self, path: &Path) -> Vec<&Folder> {
+        let mut chain = vec![&self.root];
+        while let Some(next) = chain.last().and_then(|f| {
+            f.children.iter().find_map(|n| match n {
+                Node::Folder(child) if path.starts_with(&child.path) => Some(child),
+                _ => None,
+            })
+        }) {
+            chain.push(next);
+        }
+        chain
+    }
+
+    /// Variables visible to the request (or folder) at `path`, following
+    /// Bruno's precedence: deeper folders > shallower folders > environment >
+    /// collection. Request vars are layered on top by `davi_net::prepare`.
+    ///
+    /// Folder values are resolved against the layers below them, so a folder
+    /// can extend an inherited value (`baseUrl: {{baseUrl}}/v2`).
+    pub fn var_scope(&self, path: &Path, environment: Option<&Environment>) -> VarScope {
+        let enabled = |vars: &[KeyValue]| -> Vec<(String, String)> {
+            vars.iter()
+                .filter(|v| v.enabled)
+                .map(|v| (v.name.clone(), v.value.clone()))
+                .collect()
+        };
+        let mut scope = VarScope::new();
+        if let Some(env) = environment {
+            scope.push_layer(env.enabled_vars());
+        }
+        scope.push_layer(enabled(&self.root.vars));
+
+        for folder in self.folder_chain(path).into_iter().skip(1) {
+            if !folder.vars.iter().any(|v| v.enabled) {
+                continue;
+            }
+            let resolved: Vec<(String, String)> = enabled(&folder.vars)
+                .into_iter()
+                .map(|(k, v)| {
+                    let v = scope.interpolate(&v).into_owned();
+                    (k, v)
+                })
+                .collect();
+            let mut layered = VarScope::new().with_layer(resolved);
+            layered.extend_from(&scope);
+            scope = layered;
+        }
+        scope
+    }
 }
 
 /// Read and fully parse a request file.
@@ -124,9 +189,84 @@ pub fn load_request(path: &Path) -> Result<HttpRequest, CoreError> {
 /// Serialize and atomically write a request file (write + rename), so a
 /// crash mid-save never leaves a truncated `.bru` behind.
 pub fn save_request(path: &Path, request: &HttpRequest) -> Result<(), CoreError> {
+    write_atomic(path, &bru::write_request(request))
+}
+
+fn write_atomic(path: &Path, text: &str) -> Result<(), CoreError> {
     let tmp = path.with_extension("bru.tmp");
-    std::fs::write(&tmp, bru::write_request(request)).map_err(|e| CoreError::io(&tmp, e))?;
+    std::fs::write(&tmp, text).map_err(|e| CoreError::io(&tmp, e))?;
     std::fs::rename(&tmp, path).map_err(|e| CoreError::io(path, e))
+}
+
+// ---------------------------------------------------------------------------
+// Environments and folder variables
+// ---------------------------------------------------------------------------
+
+/// `<root>/environments/<name>.bru`. The file stem is the environment name.
+pub fn environment_path(root: &Path, name: &str) -> PathBuf {
+    root.join(ENVIRONMENTS_DIR)
+        .join(format!("{}.bru", sanitize_file_name(name)))
+}
+
+/// Write `environment` to its file, creating `environments/` if needed.
+/// Secret values are not written (see [`Environment::to_bru`]).
+pub fn save_environment(root: &Path, environment: &Environment) -> Result<PathBuf, CoreError> {
+    let dir = root.join(ENVIRONMENTS_DIR);
+    std::fs::create_dir_all(&dir).map_err(|e| CoreError::io(&dir, e))?;
+    let path = environment_path(root, &environment.name);
+    write_atomic(&path, &bru::write(&environment.to_bru()))?;
+    Ok(path)
+}
+
+pub fn delete_environment(root: &Path, name: &str) -> Result<(), CoreError> {
+    let path = environment_path(root, name);
+    match std::fs::remove_file(&path) {
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(CoreError::io(&path, e)),
+        _ => Ok(()),
+    }
+}
+
+/// The file holding a folder's settings: `collection.bru` for the collection
+/// root, `folder.bru` otherwise.
+pub fn folder_settings_file(root: &Path, dir: &Path) -> PathBuf {
+    dir.join(if dir == root {
+        COLLECTION_FILE
+    } else {
+        FOLDER_FILE
+    })
+}
+
+/// Replace the variables of the folder `dir` (or of the collection when
+/// `dir == root`), keeping every other block of its settings file.
+pub fn save_folder_vars(root: &Path, dir: &Path, vars: &[KeyValue]) -> Result<(), CoreError> {
+    let path = folder_settings_file(root, dir);
+    let mut file = if path.exists() {
+        let source = std::fs::read_to_string(&path).map_err(|e| CoreError::io(&path, e))?;
+        bru::parse(&source).map_err(|e| CoreError::from(e).in_file(&path))?
+    } else if vars.is_empty() {
+        return Ok(());
+    } else {
+        BruFile::default()
+    };
+
+    if dir != root && file.block("meta").is_none() {
+        let name = dir
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        file.blocks
+            .insert(0, Block::dict("meta", vec![KeyValue::new("name", name)]));
+    }
+    let block = Block::dict(FOLDER_VARS_BLOCK, vars.to_vec());
+    match file.blocks.iter().position(|b| b.name == FOLDER_VARS_BLOCK) {
+        Some(ix) if vars.is_empty() => {
+            file.blocks.remove(ix);
+        }
+        Some(ix) => file.blocks[ix] = block,
+        None if !vars.is_empty() => file.blocks.push(block),
+        None => {}
+    }
+    write_atomic(&path, &bru::write(&file))
 }
 
 fn read_manifest_name(dir: &Path) -> Option<String> {
@@ -150,6 +290,7 @@ fn load_folder(
         name: default_name,
         seq: default_seq,
         path: path.to_path_buf(),
+        vars: Vec::new(),
         children: Vec::new(),
     };
 
@@ -173,10 +314,19 @@ fn load_folder(
                     error,
                 }),
             }
-        } else if file_name == FOLDER_FILE {
-            if let Some((name, seq)) = read_folder_meta(&entry_path) {
-                folder.name = name;
-                folder.seq = seq;
+        } else if file_name == FOLDER_FILE || (is_root && file_name == COLLECTION_FILE) {
+            match read_settings_file(&entry_path) {
+                Ok(file) => {
+                    if let Some((name, seq)) = folder_meta(&file) {
+                        folder.name = name;
+                        folder.seq = seq;
+                    }
+                    folder.vars = file.dict(FOLDER_VARS_BLOCK).unwrap_or_default().to_vec();
+                }
+                Err(error) => issues.push(LoadIssue {
+                    path: entry_path,
+                    error,
+                }),
             }
         } else if file_name == COLLECTION_FILE || !file_name.ends_with(".bru") {
             continue;
@@ -197,9 +347,12 @@ fn load_folder(
     Ok(folder)
 }
 
-fn read_folder_meta(path: &Path) -> Option<(String, Option<u32>)> {
-    let source = std::fs::read_to_string(path).ok()?;
-    let file = bru::parse(&source).ok()?;
+fn read_settings_file(path: &Path) -> Result<BruFile, CoreError> {
+    let source = std::fs::read_to_string(path).map_err(|e| CoreError::io(path, e))?;
+    bru::parse(&source).map_err(|e| CoreError::from(e).in_file(path))
+}
+
+fn folder_meta(file: &BruFile) -> Option<(String, Option<u32>)> {
     let meta = file.dict("meta")?;
     let get = |k: &str| meta.iter().find(|e| e.name == k).map(|e| e.value.as_str());
     Some((
@@ -323,12 +476,12 @@ fn write_manifest(dir: &Path, name: &str) -> Result<(), CoreError> {
 pub fn create_folder(dir: &Path, name: &str) -> Result<PathBuf, CoreError> {
     let folder = unique_path(dir, &sanitize_file_name(name), None);
     std::fs::create_dir_all(&folder).map_err(|e| CoreError::io(&folder, e))?;
-    let meta = bru::BruFile {
-        blocks: vec![bru::Block::dict(
+    let meta = BruFile {
+        blocks: vec![Block::dict(
             "meta",
             vec![
-                crate::model::KeyValue::new("name", name.trim()),
-                crate::model::KeyValue::new("seq", next_seq(dir).to_string()),
+                KeyValue::new("name", name.trim()),
+                KeyValue::new("seq", next_seq(dir).to_string()),
             ],
         )],
     };

@@ -75,3 +75,92 @@ fn scaffolds_collections_folders_and_requests() {
 
     std::fs::remove_dir_all(&tmp).unwrap();
 }
+
+#[test]
+fn environments_and_folder_vars_round_trip_and_layer() {
+    use davi_core::collection::{
+        create_collection, create_folder, create_request, delete_environment, save_environment,
+        save_folder_vars,
+    };
+    use davi_core::env::{EnvVariable, Environment};
+    use davi_core::model::KeyValue;
+
+    let tmp = std::env::temp_dir().join(format!("davi-vars-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&tmp);
+    std::fs::create_dir_all(&tmp).unwrap();
+
+    let root = create_collection(&tmp, "Vars").unwrap();
+    let users = create_folder(&root, "Users").unwrap();
+    let admin = create_folder(&users, "Admin").unwrap();
+    let top = create_request(&root, "Top").unwrap();
+    let nested = create_request(&admin, "Ban").unwrap();
+
+    let var = |name: &str, value: &str| EnvVariable {
+        name: name.into(),
+        value: value.into(),
+        enabled: true,
+        secret: false,
+    };
+    let env = Environment {
+        name: "Prod".into(),
+        variables: vec![var("host", "prod.example.com"), var("who", "env")],
+    };
+    save_environment(&root, &env).unwrap();
+    save_environment(
+        &root,
+        &Environment {
+            name: "Scratch".into(),
+            variables: vec![],
+        },
+    )
+    .unwrap();
+    delete_environment(&root, "Scratch").unwrap();
+
+    save_folder_vars(
+        &root,
+        &root,
+        &[
+            KeyValue::new("who", "collection"),
+            KeyValue::new("only", "c"),
+        ],
+    )
+    .unwrap();
+    save_folder_vars(
+        &root,
+        &users,
+        &[
+            KeyValue::new("who", "users"),
+            KeyValue::new("api", "https://{{host}}/api"),
+        ],
+    )
+    .unwrap();
+    save_folder_vars(&root, &admin, &[KeyValue::new("api", "{{api}}/admin")]).unwrap();
+
+    let c = Collection::open(&root).unwrap();
+    assert!(c.issues.is_empty(), "{:?}", c.issues);
+    assert_eq!(c.environments, std::slice::from_ref(&env));
+    // folder.bru keeps its meta; the folder still shows under its name.
+    assert_eq!(c.folder(&users).unwrap().name, "Users");
+    assert_eq!(c.folder(&admin).unwrap().vars.len(), 1);
+
+    let env = c.environment("Prod");
+    let s = c.var_scope(&nested, env);
+    assert_eq!(
+        s.interpolate("{{api}}"),
+        "https://prod.example.com/api/admin"
+    );
+    assert_eq!(s.interpolate("{{who}} {{only}}"), "users c");
+
+    // Outside the folder: environment beats collection vars.
+    let s = c.var_scope(&top, env);
+    assert_eq!(s.interpolate("{{who}} {{api}}"), "env {{api}}");
+    assert_eq!(c.var_scope(&top, None).interpolate("{{who}}"), "collection");
+
+    // Clearing the vars removes the block but keeps the folder's meta.
+    save_folder_vars(&root, &admin, &[]).unwrap();
+    let c = Collection::open(&root).unwrap();
+    assert!(c.folder(&admin).unwrap().vars.is_empty());
+    assert_eq!(c.folder(&admin).unwrap().name, "Admin");
+
+    std::fs::remove_dir_all(&tmp).unwrap();
+}
